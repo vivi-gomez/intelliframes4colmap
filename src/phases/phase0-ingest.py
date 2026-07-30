@@ -7,6 +7,7 @@ directamente. Nada aquí está simulado.
 """
 from __future__ import annotations
 
+import logging
 import json
 import subprocess
 from pathlib import Path
@@ -31,6 +32,18 @@ class IngestPhase(Phase):
 
     def run(self, ctx: PipelineContext) -> None:
         input_path = ctx.input_path
+        logging.info("Iniciando ejecución del pipeline")
+        for phase in self.phases:
+            phase_name = phase.__class__.__name__
+            logging.info(f"--- Ejecutando fase: {phase_name} ---")
+            try:
+                phase.execute(self.context)
+                logging.info(f"Fase {phase_name} completada exitosamente")
+            except Exception as e:
+                logging.error(f"Error en fase {phase_name}: {str(e)}", exc_info=True)
+                # Dependiendo de la estrategia, podrías detener o continuar
+                raise  # o break, o manejar según política
+        logging.info("Pipeline finalizado")
 
         if input_path.is_dir():
             self._ingest_image_folder(ctx, input_path)

@@ -24,6 +24,7 @@
     - No debe romper el pipeline si faltan datos de alguna fase.
     - Debe funcionar incluso con resultados parciales.
 """
+import logging
     
 from __future__ import annotations
 
@@ -50,6 +51,21 @@ class ReportPhase(Phase):
         return True
 
     def run(self, ctx) -> None:
+        logging.info("Iniciando ejecución del pipeline")
+        for phase in self.phases:
+            phase_name = phase.__class__.__name__
+            logging.info(f"--- Ejecutando fase: {phase_name} ---")
+            try:
+                phase.execute(self.context)
+                logging.info(f"Fase {phase_name} completada exitosamente")
+            except Exception as e:
+                logging.error(f"Error en fase {phase_name}: {str(e)}", exc_info=True)
+                # Dependiendo de la estrategia, podrías detener o continuar
+                raise  # o break, o manejar según política
+        logging.info("Pipeline finalizado")
+        
+        
+            
         """
         Genera los artefactos finales del pipeline.
 
