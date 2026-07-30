@@ -10,137 +10,320 @@ Fase 2 — Análisis semántico
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
+from typing import Any, Dict, List
 
-from ..pipeline.context import PipelineContext
-from ..pipeline.phase import Phase
-from ..pipeline.tool_check import DependencyReport, ToolStatus, check_model_file, check_python_package
+import cv2
+import numpy as np
 
-SAM_CHECKPOINT_ENV_DEFAULT = Path.home() / ".cache" / "intelliframes4colmap" / "sam_vit_h_4b8939.pth"
+from src.pipeline.phase import Phase
 
 
 class SemanticPhase(Phase):
-    name = "semantic"
-    optional = True  # la segmentación puede faltar sin romper el pipeline
+    """
+    Fase 2: análisis semántico ligero y segmentación.
+    - siempre calcula textura + exposición
+    - intenta segmentación con SAM si está disponible
+    - si no, usa fallback clásico
+    - si falla todo, no rompe el pipeline
+    """
 
-    def check_dependencies(self) -> DependencyReport:
-        # Núcleo (obligatorio dentro de la fase): opencv/numpy ya deberían
-        # estar si la fase 1 corrió; se listan igualmente por si se ejecuta sola.
-        checks = [
-            check_python_package("cv2", "opencv-python-headless"),
-            check_python_package("numpy", "numpy"),
-        ]
-        return DependencyReport(phase_name=self.name, checks=checks)
+    def __init__(self) -> None:
+        super().__init__("phase2-semantic")
 
-    def run(self, ctx: PipelineContext) -> None:
-        import cv2
-        import numpy as np
+    def check_dependencies(self) -> bool:
+        ok = True
 
-        texture_rows, exposure_rows = [], []
+        try:
+            import cv2 as _cv2  # noqa: F401
+            import numpy as _np  # noqa: F401
+        except Exception as exc:
+            self._last_dependency_error = f"Missing base semantic deps: {exc}"
+            return False
 
-        for frame_path in ctx.frame_list:
-            img = cv2.imread(frame_path)
-            if img is None:
-                continue
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        return ok
 
-            texture_rows.append({
-                "frame": Path(frame_path).name,
-                "texture_score": round(_texture_richness(cv2, gray), 3),
-            })
-            exposure_rows.append({
-                "frame": Path(frame_path).name,
-                **_exposure_stats(np, gray),
-            })
-
-        _write_csv(ctx.metrics_dir / "texture.csv", texture_rows, ["frame", "texture_score"])
-        _write_csv(
-            ctx.metrics_dir / "exposure.csv",
-            exposure_rows,
-            ["frame", "mean_luminance", "clipping_low_pct", "clipping_high_pct"],
-        )
-
-        avg_texture = sum(r["texture_score"] for r in texture_rows) / max(len(texture_rows), 1)
-        avg_clip_high = sum(r["clipping_high_pct"] for r in exposure_rows) / max(len(exposure_rows), 1)
-        avg_clip_low = sum(r["clipping_low_pct"] for r in exposure_rows) / max(len(exposure_rows), 1)
-
-        ctx.metrics["semantic"] = {
-            "avg_texture_score": round(avg_texture, 3),
-            "texture_level": _texture_level(avg_texture),
-            "avg_clipping_high_pct": round(avg_clip_high, 2),
-            "avg_clipping_low_pct": round(avg_clip_low, 2),
-            "exposure_variation": "HIGH" if (avg_clip_high + avg_clip_low) > 15 else "LOW",
-        }
-
-        self._run_segmentation_if_available(ctx)
-
-    def _run_segmentation_if_available(self, ctx: PipelineContext) -> None:
-        """Sub-parte opcional y pesada. No forma parte del contrato principal
-        de dependencias de la fase: se comprueba y se salta en caliente para
-        no bloquear texture/exposure si falta torch/SAM/YOLO."""
-        torch_status = check_python_package("torch", "torch")
-        sam_status = check_python_package("segment_anything", "segment-anything")
-        checkpoint_status = check_model_file("sam_vit_h_checkpoint", SAM_CHECKPOINT_ENV_DEFAULT)
-
-        available = torch_status.found and sam_status.found and checkpoint_status.found
-        ctx.dependency_log.setdefault(self.name, {})["segmentation"] = {
-            "torch": torch_status.found,
-            "segment_anything": sam_status.found,
-            "checkpoint": checkpoint_status.found,
-        }
-
-        if not available:
-            missing = [
-                s.name for s in (torch_status, sam_status, checkpoint_status) if not s.found
-            ]
-            print(
-                f"[{self.name}] Segmentación semántica omitida (falta: {missing}). "
-                f"El resto de la fase 2 se ejecutó igualmente. "
-                f"Para activarla: pip install torch segment-anything, y descarga el "
-                f"checkpoint en {SAM_CHECKPOINT_ENV_DEFAULT}"
-            )
-            ctx.metrics["semantic"]["segmentation"] = "skipped"
+    def run(self, ctx) -> None:
+        frames = list(getattr(ctx, "frame_list", []) or [])
+        if not frames:
+            ctx.metrics.setdefault("semantic", {})
+            ctx.metrics["semantic"]["status"] = "skipped_no_frames"
+            ctx.semantic = {
+                "frames": [],
+                "summary": {
+                    "mode": "none",
+                    "processed_frames": 0,
+                    "avg_texture_score": 0.0,
+                    "avg_exposure_score": 0.0,
+                    "avg_usable_area_pct": 0.0,
+                    "avg_risk_score": 0.0,
+                    "high_risk_frames": 0,
+                    "sky_dominant_frames": 0,
+                    "dynamic_content_frames": 0,
+                    "reflection_problem_frames": 0,
+                },
+            }
             return
 
-        # Import perezoso: solo si todo está disponible.
-        from ._segmentation_backend import run_sam_segmentation
+        metrics_dir = Path(ctx.metrics_dir)
+        masks_dir = Path(ctx.masks_dir)
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        masks_dir.mkdir(parents=True, exist_ok=True)
 
-        ctx.masks_dir.mkdir(parents=True, exist_ok=True)
-        run_sam_segmentation(ctx.frame_list, ctx.masks_dir, SAM_CHECKPOINT_ENV_DEFAULT)
-        ctx.metrics["semantic"]["segmentation"] = "done"
+        texture_rows = self._compute_texture_metrics(frames)
+        exposure_rows = self._compute_exposure_metrics(frames)
 
+        self._write_csv(metrics_dir / "texture.csv", texture_rows)
+        self._write_csv(metrics_dir / "exposure.csv", exposure_rows)
 
-def _texture_richness(cv2, gray) -> float:
-    """Densidad de keypoints ORB por megapíxel."""
-    orb = cv2.ORB_create(nfeatures=5000)
-    kp = orb.detect(gray, None)
-    h, w = gray.shape
-    megapixels = (h * w) / 1_000_000
-    return len(kp) / megapixels if megapixels else 0.0
+        segmentation_rows, segmentation_mode = self._run_segmentation(ctx, frames, masks_dir)
 
+        if segmentation_rows:
+            self._write_csv(metrics_dir / "segmentation.csv", segmentation_rows)
+            self._write_segmentation_summary(
+                metrics_dir / "segmentation_summary.json",
+                segmentation_rows,
+                segmentation_mode,
+            )
 
-def _texture_level(avg_score: float) -> str:
-    if avg_score >= 4000:
-        return "HIGH"
-    if avg_score >= 1500:
-        return "MEDIUM"
-    return "LOW"
+        avg_texture = round(
+            float(np.mean([row["texture_score"] for row in texture_rows])) if texture_rows else 0.0,
+            3,
+        )
+        avg_exposure = round(
+            float(np.mean([row["exposure_score"] for row in exposure_rows])) if exposure_rows else 0.0,
+            3,
+        )
 
+        semantic_summary = self._build_semantic_summary(
+            segmentation_rows=segmentation_rows,
+            segmentation_mode=segmentation_mode,
+            avg_texture=avg_texture,
+            avg_exposure=avg_exposure,
+        )
 
-def _exposure_stats(np, gray) -> dict:
-    hist = np.histogram(gray, bins=256, range=(0, 255))[0]
-    total = hist.sum()
-    clipping_low = 100.0 * hist[:5].sum() / total if total else 0.0
-    clipping_high = 100.0 * hist[-5:].sum() / total if total else 0.0
-    return {
-        "mean_luminance": round(float(gray.mean()), 2),
-        "clipping_low_pct": round(float(clipping_low), 2),
-        "clipping_high_pct": round(float(clipping_high), 2),
-    }
+        ctx.semantic = {
+            "frames": segmentation_rows,
+            "summary": semantic_summary,
+        }
 
+        ctx.metrics.setdefault("semantic", {})
+        ctx.metrics["semantic"].update(
+            {
+                "status": "done",
+                "texture_csv": str(metrics_dir / "texture.csv"),
+                "exposure_csv": str(metrics_dir / "exposure.csv"),
+                "avg_texture_score": avg_texture,
+                "avg_exposure_score": avg_exposure,
+                "segmentation": "done" if segmentation_rows else "skipped",
+                "segmentation_mode": segmentation_mode,
+                "avg_usable_area_pct": semantic_summary["avg_usable_area_pct"],
+                "avg_risk_score": semantic_summary["avg_risk_score"],
+            }
+        )
 
-def _write_csv(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    def _compute_texture_metrics(self, frames: List[str]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+
+        for frame_path in frames:
+            img = cv2.imread(str(frame_path), cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                rows.append(
+                    {
+                        "frame": Path(frame_path).name,
+                        "texture_score": 0.0,
+                        "texture_level": "UNKNOWN",
+                        "error": "unreadable_frame",
+                    }
+                )
+                continue
+
+            lap = cv2.Laplacian(img, cv2.CV_64F)
+            score = float(lap.var())
+
+            if score < 20:
+                level = "LOW"
+            elif score < 80:
+                level = "MEDIUM"
+            else:
+                level = "HIGH"
+
+            rows.append(
+                {
+                    "frame": Path(frame_path).name,
+                    "texture_score": round(score, 3),
+                    "texture_level": level,
+                }
+            )
+
+        return rows
+
+    def _compute_exposure_metrics(self, frames: List[str]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+
+        for frame_path in frames:
+            img = cv2.imread(str(frame_path), cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                rows.append(
+                    {
+                        "frame": Path(frame_path).name,
+                        "mean_brightness": 0.0,
+                        "std_brightness": 0.0,
+                        "exposure_score": 0.0,
+                        "exposure_level": "UNKNOWN",
+                        "error": "unreadable_frame",
+                    }
+                )
+                continue
+
+            mean_val = float(np.mean(img))
+            std_val = float(np.std(img))
+
+            # ideal simple around midtones
+            exposure_score = max(0.0, 100.0 - abs(mean_val - 127.5) * 0.75)
+
+            if exposure_score < 40:
+                level = "POOR"
+            elif exposure_score < 70:
+                level = "FAIR"
+            else:
+                level = "GOOD"
+
+            rows.append(
+                {
+                    "frame": Path(frame_path).name,
+                    "mean_brightness": round(mean_val, 3),
+                    "std_brightness": round(std_val, 3),
+                    "exposure_score": round(exposure_score, 3),
+                    "exposure_level": level,
+                }
+            )
+
+        return rows
+
+    def _run_segmentation(self, ctx, frames: List[str], masks_dir: Path):
+        dep_log = ctx.dependency_log.setdefault(self.name, {})
+        checkpoint = self._find_sam_checkpoint(ctx)
+
+        try:
+            import torch  # noqa: F401
+            from segment_anything import sam_model_registry  # noqa: F401
+            from src.phases._segmentation_backend import run_segmentation
+
+            if checkpoint:
+                rows = run_segmentation(
+                    frame_list=frames,
+                    masks_dir=masks_dir,
+                    mode="sam",
+                    checkpoint_path=checkpoint,
+                )
+                dep_log["segmentation"] = "sam"
+                return rows, "sam"
+        except Exception as exc:
+            dep_log["sam_error"] = str(exc)
+
+        try:
+            from src.phases._segmentation_backend import run_segmentation
+
+            rows = run_segmentation(
+                frame_list=frames,
+                masks_dir=masks_dir,
+                mode="classical",
+                checkpoint_path=None,
+            )
+            dep_log["segmentation"] = "classical"
+            return rows, "classical"
+        except Exception as exc:
+            dep_log["segmentation"] = "skipped"
+            dep_log["segmentation_error"] = str(exc)
+            return [], "none"
+
+    def _find_sam_checkpoint(self, ctx) -> str | None:
+        candidates = [
+            getattr(ctx, "sam_checkpoint", None),
+            "sam_vit_h_4b8939.pth",
+            "models/sam_vit_h_4b8939.pth",
+            "checkpoints/sam_vit_h_4b8939.pth",
+        ]
+        for candidate in candidates:
+            if not candidate:
+                continue
+            p = Path(candidate)
+            if p.exists():
+                return str(p)
+        return None
+
+    def _build_semantic_summary(
+        self,
+        segmentation_rows: List[Dict[str, Any]],
+        segmentation_mode: str,
+        avg_texture: float,
+        avg_exposure: float,
+    ) -> Dict[str, Any]:
+        if not segmentation_rows:
+            return {
+                "mode": segmentation_mode,
+                "processed_frames": 0,
+                "avg_texture_score": avg_texture,
+                "avg_exposure_score": avg_exposure,
+                "avg_usable_area_pct": 0.0,
+                "avg_risk_score": 0.0,
+                "high_risk_frames": 0,
+                "sky_dominant_frames": 0,
+                "dynamic_content_frames": 0,
+                "reflection_problem_frames": 0,
+            }
+
+        avg_usable = round(
+            float(np.mean([row.get("usable_area_pct", 0.0) for row in segmentation_rows])), 3
+        )
+        avg_risk = round(
+            float(np.mean([row.get("photogrammetry_risk_score", 0.0) for row in segmentation_rows])),
+            3,
+        )
+        high_risk = sum(1 for row in segmentation_rows if row.get("risk_level") == "HIGH")
+        sky_dominant = sum(1 for row in segmentation_rows if row.get("sky_pct", 0.0) >= 35.0)
+        dynamic_content = sum(
+            1 for row in segmentation_rows if row.get("dynamic_risk_pct", 0.0) >= 10.0
+        )
+        reflection_problem = sum(
+            1 for row in segmentation_rows if row.get("reflection_pct", 0.0) >= 10.0
+        )
+
+        return {
+            "mode": segmentation_mode,
+            "processed_frames": len(segmentation_rows),
+            "avg_texture_score": avg_texture,
+            "avg_exposure_score": avg_exposure,
+            "avg_usable_area_pct": avg_usable,
+            "avg_risk_score": avg_risk,
+            "high_risk_frames": high_risk,
+            "sky_dominant_frames": sky_dominant,
+            "dynamic_content_frames": dynamic_content,
+            "reflection_problem_frames": reflection_problem,
+        }
+
+    def _write_segmentation_summary(
+        self,
+        path: Path,
+        rows: List[Dict[str, Any]],
+        mode: str,
+    ) -> None:
+        summary = self._build_semantic_summary(
+            segmentation_rows=rows,
+            segmentation_mode=mode,
+            avg_texture=0.0,
+            avg_exposure=0.0,
+        )
+        path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def _write_csv(self, path: Path, rows: List[Dict[str, Any]]) -> None:
+        if not rows:
+            return
+
+        fieldnames = list(rows[0].keys())
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
