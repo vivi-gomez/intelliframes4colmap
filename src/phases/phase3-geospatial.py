@@ -27,7 +27,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from src.pipeline.phase import Phase
+from ..pipeline.context import PipelineContext
+from ..pipeline.phase import Phase
 
 
 class GeospatialPhase(Phase):

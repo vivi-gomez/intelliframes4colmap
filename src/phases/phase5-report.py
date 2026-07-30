@@ -29,8 +29,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.pipeline.phase import Phase
-from src.phases._report_builder import (
+from ..pipeline.context import PipelineContext
+from ..pipeline.phase import Phase
+from ._report_builder import (
     build_analysis_payload,
     build_html_report,
     save_analysis_json,
@@ -40,9 +41,7 @@ from src.phases._report_builder import (
 
 class ReportPhase(Phase):
 
-
-    def __init__(self) -> None:
-        super().__init__("phase5-report")
+    name = "report"
 
     def check_dependencies(self) -> bool:
         """

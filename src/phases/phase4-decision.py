@@ -34,14 +34,18 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from src.pipeline.phase import Phase
+from ..pipeline.context import PipelineContext
+from ..pipeline.phase import Phase
 
 
 class DecisionPhase(Phase):
+    """
+    Fase 4: motor de decisión para preparar una configuración recomendada
+    de COLMAP a partir de métricas de calidad, semántica y geoespaciales.
+    """
 
-
-    def __init__(self) -> None:
-        super().__init__("phase4-decision")
+    name = "decision"
+    
 
     def check_dependencies(self) -> bool:
         """
