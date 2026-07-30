@@ -1,1 +1,0 @@
-# Core analysis module for intelliframes4colmap

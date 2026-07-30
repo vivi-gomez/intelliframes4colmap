@@ -1,1 +1,0 @@
-# Utils module for intelliframes4colmap
