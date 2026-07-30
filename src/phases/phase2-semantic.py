@@ -17,7 +17,9 @@ from typing import Any, Dict, List
 import cv2
 import numpy as np
 
-from src.pipeline.phase import Phase
+from ..pipeline.context import PipelineContext
+from ..pipeline.phase import Phase
+from ..pipeline.tool_check import DependencyReport, check_python_package
 
 
 class SemanticPhase(Phase):
@@ -29,20 +31,19 @@ class SemanticPhase(Phase):
     - si falla todo, no rompe el pipeline
     """
 
-    def __init__(self) -> None:
-        super().__init__("phase2-semantic")
+    name = "semantic"
+    optional = False
 
-    def check_dependencies(self) -> bool:
-        ok = True
+    def check_dependencies(self) -> DependencyReport:
+        return DependencyReport(
+            phase_name=self.name,
+            checks=[
+                check_python_package("cv2", "opencv-python-headless"),
+                check_python_package("numpy", "numpy"),
+            ],
+        )
 
-        try:
-            import cv2 as _cv2  # noqa: F401
-            import numpy as _np  # noqa: F401
-        except Exception as exc:
-            self._last_dependency_error = f"Missing base semantic deps: {exc}"
-            return False
-
-        return ok
+    def run(self, ctx: PipelineContext) -> None:
 
     def run(self, ctx) -> None:
         frames = list(getattr(ctx, "frame_list", []) or [])
@@ -209,7 +210,7 @@ class SemanticPhase(Phase):
         try:
             import torch  # noqa: F401
             from segment_anything import sam_model_registry  # noqa: F401
-            from src.phases._segmentation_backend import run_segmentation
+            from ._segmentation_backend import run_segmentation
 
             if checkpoint:
                 rows = run_segmentation(
@@ -224,7 +225,7 @@ class SemanticPhase(Phase):
             dep_log["sam_error"] = str(exc)
 
         try:
-            from src.phases._segmentation_backend import run_segmentation
+            from ._segmentation_backend import run_segmentation
 
             rows = run_segmentation(
                 frame_list=frames,
