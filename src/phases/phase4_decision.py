@@ -97,11 +97,13 @@ class DecisionPhase(Phase):
         quality_rows = self._collect_quality_rows(ctx, frames)
         semantic_rows = self._collect_semantic_rows(ctx)
         geospatial_summary = self._collect_geospatial_summary(ctx)
+        physically_selected = self._collect_physically_selected(ctx)
 
         frame_decisions = self._score_frames(
             frames=frames,
             quality_rows=quality_rows,
             semantic_rows=semantic_rows,
+            physically_selected=physically_selected,
         )
 
         selected_frames = [row for row in frame_decisions if row["selected"]]
@@ -186,19 +188,54 @@ class DecisionPhase(Phase):
         geospatial = getattr(ctx, "geospatial", {}) or {}
         return geospatial.get("summary", {}) if isinstance(geospatial, dict) else {}
 
+    def _collect_physically_selected(self, ctx) -> Dict[str, bool] | None:
+        """
+        Lee qué frames quedaron físicamente en frames_selected/ tras la fase
+        de calidad (nitidez). Es la única fuente de verdad sobre "nítido o
+        no": esta fase de decisión NO debe volver a decidir eso desde cero
+        con sus propias reglas, o se puede acabar con dos números
+        contradictorios (ej. "frames_selected/ tiene 73, pero el report dice
+        Frames recomendados: 0/73") como ocurría antes.
+
+        Devuelve None si no hay datos físicos (p.ej. la fase de calidad no
+        se ejecutó), para que el resto del código sepa que debe usar el
+        criterio de puntuación como único fallback.
+        """
+        selected_dir = getattr(ctx, "frames_selected_dir", None)
+        if not selected_dir or not Path(selected_dir).is_dir():
+            return None
+
+        names = {p.name for p in Path(selected_dir).glob("*") if p.is_file()}
+        if not names:
+            return None
+        return {name: True for name in names}
+
     def _score_frames(
         self,
         frames: List[str],
         quality_rows: Dict[str, Dict[str, Any]],
         semantic_rows: Dict[str, Dict[str, Any]],
+        physically_selected: Dict[str, bool] | None,
     ) -> List[Dict[str, Any]]:
         """
         Puntúa cada frame combinando calidad y semántica.
 
-        Filosofía:
-        - penalizar frames con alto riesgo fotogramétrico,
-        - favorecer textura suficiente y exposición razonable,
-        - mantener reglas simples y transparentes.
+        Filosofía (revisada):
+        - La decisión de "nítido / no nítido" YA la tomó la fase de calidad
+          físicamente (frames_selected/ vs frames_rejected/). Esta fase no
+          la contradice: si un frame está en frames_selected/, parte como
+          seleccionado.
+        - A partir de ahí, solo se puede rechazar un frame aquí por señales
+          semánticas realmente graves: una gran parte del frame tuvo que
+          enmascararse por un objeto dinámico anómalo (persona/vehículo/
+          animal/ave cruzando la escena), dejando muy poca área útil.
+        - Las categorías estáticas (cielo, agua, vegetación, superficies
+          lisas / fondo desenfocado con lente macro, etc.) NUNCA rechazan un
+          frame por sí solas: para eso están las máscaras, no el descarte
+          del frame completo. Antes de esta corrección, un fondo con fuerte
+          DOF (lente macro) se clasificaba como "low_texture" y tumbaba el
+          área útil por debajo del umbral, rechazando prácticamente todos
+          los frames aunque la reconstrucción real funcionara.
         """
         decisions: List[Dict[str, Any]] = []
 
@@ -212,10 +249,17 @@ class DecisionPhase(Phase):
 
             final_score = max(0.0, min(100.0, quality_score - semantic_penalty))
 
+            quality_selected = (
+                physically_selected[frame_name]
+                if physically_selected is not None and frame_name in physically_selected
+                else None
+            )
+
             selected, reject_reasons = self._selection_rule(
                 quality_row=q,
                 semantic_row=s,
                 final_score=final_score,
+                quality_selected=quality_selected,
             )
 
             decisions.append(
@@ -227,9 +271,9 @@ class DecisionPhase(Phase):
                     "final_score": round(final_score, 3),
                     "selected": selected,
                     "reject_reasons": reject_reasons,
-                    "risk_level": s.get("risk_level", "UNKNOWN"),
                     "usable_area_pct": s.get("usable_area_pct", ""),
-                    "photogrammetry_risk_score": s.get("photogrammetry_risk_score", ""),
+                    "masked_categories": s.get("masked_categories", []),
+                    "dynamic_masked_pct": s.get("dynamic_masked_pct", 0.0),
                 }
             )
 
@@ -265,60 +309,67 @@ class DecisionPhase(Phase):
 
     def _estimate_semantic_penalty(self, semantic_row: Dict[str, Any]) -> float:
         """
-        Estima una penalización a partir de señales semánticas.
+        Estima una penalización SOLO informativa (afecta a `final_score`,
+        que se usa para ordenar/reportar, no para decidir selección — eso lo
+        hace `_selection_rule` con criterios propios más estrictos).
+
+        Importante: las categorías estáticas (cielo, agua, vegetación,
+        superficies lisas / fondo desenfocado) ya no penalizan aquí. Esas
+        categorías se gestionan con máscaras (fase 2), no penalizando o
+        rechazando el frame completo. Solo lo dinámico enmascarado por
+        anomalía (personas/vehículos/animales/aves fuera de contexto) resta
+        puntuación, porque reduce el área realmente utilizable del frame.
         """
         if not semantic_row:
             return 0.0
 
-        if isinstance(semantic_row.get("photogrammetry_risk_score"), (int, float)):
-            return float(semantic_row["photogrammetry_risk_score"]) * 0.7
+        dynamic_masked_pct = semantic_row.get("dynamic_masked_pct")
+        if isinstance(dynamic_masked_pct, (int, float)):
+            return float(dynamic_masked_pct) * 0.5
 
-        penalty = 0.0
-        for key, weight in (
-            ("sky_pct", 0.25),
-            ("water_pct", 0.35),
-            ("reflection_pct", 0.25),
-            ("low_texture_pct", 0.20),
-            ("vegetation_pct", 0.10),
-            ("person_pct", 0.50),
-            ("vehicle_pct", 0.50),
-        ):
-            value = semantic_row.get(key)
-            if isinstance(value, (int, float)):
-                penalty += float(value) * weight
-
-        return penalty
+        return 0.0
 
     def _selection_rule(
         self,
         quality_row: Dict[str, Any],
         semantic_row: Dict[str, Any],
         final_score: float,
+        quality_selected: bool | None,
     ) -> Tuple[bool, List[str]]:
         """
         Decide si un frame debe recomendarse para COLMAP.
 
-        Reglas iniciales:
-        - rechaza puntuaciones finales bajas,
-        - rechaza riesgo semántico muy alto,
-        - rechaza área utilizable demasiado baja.
+        - Si la fase de calidad ya decidió físicamente que este frame no es
+          lo bastante nítido (está en frames_rejected/), se respeta esa
+          decisión: se rechaza aquí también, sin repetir el cálculo con
+          otro criterio que podría contradecirla.
+        - Si la fase de calidad lo aceptó (está en frames_selected/), el
+          frame parte SELECCIONADO. Solo se puede tumbar aquí si una gran
+          parte del frame tuvo que enmascararse por un objeto dinámico
+          anómalo (más del 45% del área), porque entonces apenas queda
+          contenido útil para el matching pese a la máscara.
+        - Si no hay datos físicos de la fase de calidad (p.ej. se saltó),
+          se recurre a `final_score` como único criterio de respaldo.
         """
         reasons: List[str] = []
 
-        if final_score < 35.0:
+        dynamic_masked_pct = semantic_row.get("dynamic_masked_pct")
+        heavy_dynamic_occlusion = (
+            isinstance(dynamic_masked_pct, (int, float)) and dynamic_masked_pct > 45.0
+        )
+        if heavy_dynamic_occlusion:
+            reasons.append("heavy_dynamic_occlusion")
+
+        if quality_selected is not None:
+            if not quality_selected:
+                reasons.append("low_sharpness")
+            return (len(reasons) == 0), reasons
+
+        # Sin dato físico de calidad (fallback): usar la puntuación agregada.
+        if final_score < 25.0:
             reasons.append("low_final_score")
 
-        risk_level = semantic_row.get("risk_level")
-        if risk_level == "HIGH":
-            reasons.append("high_semantic_risk")
-
-        usable_area = semantic_row.get("usable_area_pct")
-        if isinstance(usable_area, (int, float)) and usable_area < 35.0:
-            reasons.append("low_usable_area")
-
         if not quality_row and not semantic_row:
-            # Si no hay datos, no bloquear por completo.
-            # Mantenemos el frame como provisionalmente válido.
             return True, []
 
         return len(reasons) == 0, reasons

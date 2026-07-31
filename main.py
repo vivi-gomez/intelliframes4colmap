@@ -64,6 +64,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="logs",
         help="Carpeta donde se escriben los logs de ejecución (por defecto: ./logs)",
     )
+    parser.add_argument(
+        "--no-auto-environment-mask",
+        action="store_true",
+        help=(
+            "En modo automático, no excluir por defecto cielo/agua/reflejos "
+            "de las máscaras (por defecto sí se excluyen)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -89,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
         output_dir=Path(args.output),
         unattended=args.unattended,
         on_missing_dep=args.on_missing_dep,
+        auto_environment_mask=not args.no_auto_environment_mask,
     )
     if args.telemetry:
         ctx.telemetry_path = Path(args.telemetry)

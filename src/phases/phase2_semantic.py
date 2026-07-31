@@ -1,13 +1,18 @@
 """
-Fase 2 — Análisis semántico
+Fase 2 — Análisis semántico y máscaras
 
-- Texture richness y exposición: reales, solo necesitan OpenCV/numpy (ya
-  requeridos en fase 1), así que siempre se calculan.
-- Segmentación (SAM / clásica / YOLO para personas y vehículos): pesada
-  (SAM requiere torch + checkpoints de varios cientos de MB, YOLO requiere
-  ultralytics). Es opcional en el sentido de que si algún backend no está
-  disponible, se degrada de forma controlada; el resto de la fase sí se
-  ejecuta siempre.
+- Texture richness y exposición: reales, solo necesitan OpenCV/numpy.
+- Máscaras (convención COLMAP: blanco = procesar, negro = ignorar):
+    * Modo ATENDIDO (ctx.unattended == False): se pregunta una única vez,
+      antes de procesar ningún frame, "What do you want to ignore from
+      images?". Solo se excluyen las categorías que el usuario pida.
+    * Modo AUTOMÁTICO (ctx.unattended == True): las categorías estáticas
+      "universales" (cielo, agua, reflejos) se excluyen por defecto
+      (desactivable con --no-auto-environment-mask). Las categorías
+      dinámicas (personas, vehículos, animales, aves) SOLO se excluyen si
+      _scene_analyzer.py las marca como anomalía respecto al resto de la
+      secuencia (aparición transitoria o movimiento incoherente con la
+      cámara) — nunca por pertenecer a esa clase sin más.
 """
 from __future__ import annotations
 
@@ -23,18 +28,14 @@ import numpy as np
 from ..pipeline.context import PipelineContext
 from ..pipeline.phase import Phase
 from ..pipeline.tool_check import DependencyReport, check_python_package
+from . import _segmentation_backend as seg
 
 logger = logging.getLogger(__name__)
 
 
 class SemanticPhase(Phase):
     """
-    Fase 2: análisis semántico ligero y segmentación.
-    - siempre calcula textura + exposición
-    - intenta segmentación con SAM si está disponible
-    - si no, usa fallback clásico (que a su vez intenta YOLO para
-      personas/vehículos y degrada a máscara vacía si tampoco está)
-    - si falla todo, no rompe el pipeline
+    Fase 2: análisis semántico ligero (textura, exposición) + máscaras.
     """
 
     name = "semantic"
@@ -62,21 +63,7 @@ class SemanticPhase(Phase):
             logger.warning("Fase semántica: no hay frames, se omite el análisis.")
             ctx.metrics.setdefault("semantic", {})
             ctx.metrics["semantic"]["status"] = "skipped_no_frames"
-            ctx.semantic = {
-                "frames": [],
-                "summary": {
-                    "mode": "none",
-                    "processed_frames": 0,
-                    "avg_texture_score": 0.0,
-                    "avg_exposure_score": 0.0,
-                    "avg_usable_area_pct": 0.0,
-                    "avg_risk_score": 0.0,
-                    "high_risk_frames": 0,
-                    "sky_dominant_frames": 0,
-                    "dynamic_content_frames": 0,
-                    "reflection_problem_frames": 0,
-                },
-            }
+            ctx.semantic = {"frames": [], "summary": _empty_summary("none")}
             return
 
         metrics_dir = Path(ctx.metrics_dir)
@@ -86,263 +73,172 @@ class SemanticPhase(Phase):
 
         texture_rows = self._compute_texture_metrics(frames)
         exposure_rows = self._compute_exposure_metrics(frames)
-
         self._write_csv(metrics_dir / "texture.csv", texture_rows)
         self._write_csv(metrics_dir / "exposure.csv", exposure_rows)
 
-        segmentation_rows, segmentation_mode = self._run_segmentation(ctx, frames, masks_dir)
+        static_categories, dynamic_boxes_per_frame, mask_mode = self._decide_masking_plan(ctx, frames)
+
+        segmentation_rows = seg.run_segmentation(
+            frame_list=frames,
+            masks_dir=masks_dir,
+            requested_static_categories=static_categories,
+            dynamic_boxes_per_frame=dynamic_boxes_per_frame,
+        )
 
         if segmentation_rows:
             self._write_csv(metrics_dir / "segmentation.csv", segmentation_rows)
-            self._write_segmentation_summary(
-                metrics_dir / "segmentation_summary.json",
-                segmentation_rows,
-                segmentation_mode,
-            )
 
-        avg_texture = round(
-            float(np.mean([row["texture_score"] for row in texture_rows])) if texture_rows else 0.0,
-            3,
-        )
-        avg_exposure = round(
-            float(np.mean([row["exposure_score"] for row in exposure_rows])) if exposure_rows else 0.0,
-            3,
-        )
+        avg_texture = round(float(np.mean([r["texture_score"] for r in texture_rows])) if texture_rows else 0.0, 3)
+        avg_exposure = round(float(np.mean([r["exposure_score"] for r in exposure_rows])) if exposure_rows else 0.0, 3)
 
         semantic_summary = self._build_semantic_summary(
-            segmentation_rows=segmentation_rows,
-            segmentation_mode=segmentation_mode,
-            avg_texture=avg_texture,
-            avg_exposure=avg_exposure,
+            segmentation_rows, mask_mode, static_categories, dynamic_boxes_per_frame, avg_texture, avg_exposure
+        )
+        (metrics_dir / "segmentation_summary.json").write_text(
+            json.dumps(semantic_summary, indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
-        ctx.semantic = {
-            "frames": segmentation_rows,
-            "summary": semantic_summary,
-        }
+        ctx.semantic = {"frames": segmentation_rows, "summary": semantic_summary}
 
         ctx.metrics.setdefault("semantic", {})
-        ctx.metrics["semantic"].update(
-            {
-                "status": "done",
-                "texture_csv": str(metrics_dir / "texture.csv"),
-                "exposure_csv": str(metrics_dir / "exposure.csv"),
-                "avg_texture_score": avg_texture,
-                "avg_exposure_score": avg_exposure,
-                "segmentation": "done" if segmentation_rows else "skipped",
-                "segmentation_mode": segmentation_mode,
-                "avg_usable_area_pct": semantic_summary["avg_usable_area_pct"],
-                "avg_risk_score": semantic_summary["avg_risk_score"],
-            }
-        )
+        ctx.metrics["semantic"].update({
+            "status": "done",
+            "texture_csv": str(metrics_dir / "texture.csv"),
+            "exposure_csv": str(metrics_dir / "exposure.csv"),
+            "avg_texture_score": avg_texture,
+            "avg_exposure_score": avg_exposure,
+            "mask_mode": mask_mode,
+            "masked_static_categories": sorted(static_categories),
+            "avg_usable_area_pct": semantic_summary["avg_usable_area_pct"],
+        })
+
+    # -- Plan de máscaras ---------------------------------------------------
+
+    def _decide_masking_plan(self, ctx: PipelineContext, frames: List[str]):
+        """
+        Decide qué se enmascara y cómo, según el modo de ejecución.
+
+        Devuelve (static_categories, dynamic_boxes_per_frame, mode_label).
+        """
+        if not ctx.unattended:
+            requested = seg.prompt_ignore_categories()
+            static_categories = requested & seg.STATIC_CATEGORIES
+            dynamic_categories = requested & seg.DYNAMIC_CATEGORIES
+
+            dynamic_boxes_per_frame: Dict[str, List[Dict[str, Any]]] = {}
+            if dynamic_categories:
+                dynamic_boxes_per_frame = self._detect_requested_dynamic_categories(
+                    frames, dynamic_categories
+                )
+            return static_categories, dynamic_boxes_per_frame, "attended"
+
+        # Modo automático.
+        auto_environment = getattr(ctx, "auto_environment_mask", True)
+        static_categories = set(seg.AUTO_ENVIRONMENT_CATEGORIES) if auto_environment else set()
+
+        try:
+            from ._scene_analyzer import analyze_dynamic_objects
+            dynamic_boxes_per_frame = analyze_dynamic_objects(frames)
+        except Exception:
+            logger.warning(
+                "No se pudo ejecutar el análisis de anomalías de secuencia; "
+                "no se enmascarará ningún objeto dinámico.",
+                exc_info=True,
+            )
+            dynamic_boxes_per_frame = {}
+
+        return static_categories, dynamic_boxes_per_frame, "automatic"
+
+    def _detect_requested_dynamic_categories(
+        self, frames: List[str], dynamic_categories: set
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Modo atendido: el usuario pidió explícitamente ignorar personas,
+        vehículos, animales y/o aves. Aquí SÍ se enmascara toda detección de
+        esas categorías (es una petición explícita, no una inferencia).
+        """
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        for frame_path in frames:
+            img = cv2.imread(str(frame_path))
+            if img is None:
+                continue
+            detections = [
+                d for d in seg.detect_dynamic_boxes(img)
+                if d["category"] in dynamic_categories
+            ]
+            if detections:
+                result[Path(frame_path).name] = detections
+        return result
+
+    # -- Métricas de textura / exposición -----------------------------------
 
     def _compute_texture_metrics(self, frames: List[str]) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
-
         for frame_path in frames:
             img = cv2.imread(str(frame_path), cv2.IMREAD_GRAYSCALE)
             if img is None:
-                logger.warning("Frame ilegible en cálculo de textura: %s", frame_path)
-                rows.append(
-                    {
-                        "frame": Path(frame_path).name,
-                        "texture_score": 0.0,
-                        "texture_level": "UNKNOWN",
-                        "error": "unreadable_frame",
-                    }
-                )
+                rows.append({"frame": Path(frame_path).name, "texture_score": 0.0, "texture_level": "UNKNOWN", "error": "unreadable_frame"})
                 continue
-
-            lap = cv2.Laplacian(img, cv2.CV_64F)
-            score = float(lap.var())
-
-            if score < 20:
-                level = "LOW"
-            elif score < 80:
-                level = "MEDIUM"
-            else:
-                level = "HIGH"
-
-            rows.append(
-                {
-                    "frame": Path(frame_path).name,
-                    "texture_score": round(score, 3),
-                    "texture_level": level,
-                }
-            )
-
+            score = float(cv2.Laplacian(img, cv2.CV_64F).var())
+            level = "LOW" if score < 20 else ("MEDIUM" if score < 80 else "HIGH")
+            rows.append({"frame": Path(frame_path).name, "texture_score": round(score, 3), "texture_level": level})
         return rows
 
     def _compute_exposure_metrics(self, frames: List[str]) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
-
         for frame_path in frames:
             img = cv2.imread(str(frame_path), cv2.IMREAD_GRAYSCALE)
             if img is None:
-                logger.warning("Frame ilegible en cálculo de exposición: %s", frame_path)
-                rows.append(
-                    {
-                        "frame": Path(frame_path).name,
-                        "mean_brightness": 0.0,
-                        "std_brightness": 0.0,
-                        "exposure_score": 0.0,
-                        "exposure_level": "UNKNOWN",
-                        "error": "unreadable_frame",
-                    }
-                )
+                rows.append({"frame": Path(frame_path).name, "mean_brightness": 0.0, "std_brightness": 0.0, "exposure_score": 0.0, "exposure_level": "UNKNOWN", "error": "unreadable_frame"})
                 continue
-
             mean_val = float(np.mean(img))
             std_val = float(np.std(img))
-
-            # ideal simple around midtones
             exposure_score = max(0.0, 100.0 - abs(mean_val - 127.5) * 0.75)
-
-            if exposure_score < 40:
-                level = "POOR"
-            elif exposure_score < 70:
-                level = "FAIR"
-            else:
-                level = "GOOD"
-
-            rows.append(
-                {
-                    "frame": Path(frame_path).name,
-                    "mean_brightness": round(mean_val, 3),
-                    "std_brightness": round(std_val, 3),
-                    "exposure_score": round(exposure_score, 3),
-                    "exposure_level": level,
-                }
-            )
-
+            level = "POOR" if exposure_score < 40 else ("FAIR" if exposure_score < 70 else "GOOD")
+            rows.append({
+                "frame": Path(frame_path).name,
+                "mean_brightness": round(mean_val, 3),
+                "std_brightness": round(std_val, 3),
+                "exposure_score": round(exposure_score, 3),
+                "exposure_level": level,
+            })
         return rows
-
-    def _run_segmentation(self, ctx, frames: List[str], masks_dir: Path):
-        dep_log = ctx.dependency_log.setdefault(self.name, {})
-        checkpoint = self._find_sam_checkpoint(ctx)
-
-        try:
-            import torch  # noqa: F401
-            from segment_anything import sam_model_registry  # noqa: F401
-            from ._segmentation_backend import run_segmentation
-
-            if checkpoint:
-                rows = run_segmentation(
-                    frame_list=frames,
-                    masks_dir=masks_dir,
-                    mode="sam",
-                    checkpoint_path=checkpoint,
-                )
-                dep_log["segmentation"] = "sam"
-                return rows, "sam"
-        except Exception as exc:
-            logger.info("Segmentación SAM no disponible (%s); se usa fallback clásico.", exc)
-            dep_log["sam_error"] = str(exc)
-
-        try:
-            from ._segmentation_backend import run_segmentation
-
-            rows = run_segmentation(
-                frame_list=frames,
-                masks_dir=masks_dir,
-                mode="classical",
-                checkpoint_path=None,
-            )
-            dep_log["segmentation"] = "classical"
-            return rows, "classical"
-        except Exception as exc:
-            logger.error("Segmentación clásica también falló; se omite la segmentación.", exc_info=True)
-            dep_log["segmentation"] = "skipped"
-            dep_log["segmentation_error"] = str(exc)
-            return [], "none"
-
-    def _find_sam_checkpoint(self, ctx) -> str | None:
-        candidates = [
-            getattr(ctx, "sam_checkpoint", None),
-            "sam_vit_h_4b8939.pth",
-            "models/sam_vit_h_4b8939.pth",
-            "checkpoints/sam_vit_h_4b8939.pth",
-        ]
-        for candidate in candidates:
-            if not candidate:
-                continue
-            p = Path(candidate)
-            if p.exists():
-                return str(p)
-        return None
 
     def _build_semantic_summary(
         self,
         segmentation_rows: List[Dict[str, Any]],
-        segmentation_mode: str,
+        mask_mode: str,
+        static_categories: set,
+        dynamic_boxes_per_frame: Dict[str, List[Dict[str, Any]]],
         avg_texture: float,
         avg_exposure: float,
     ) -> Dict[str, Any]:
         if not segmentation_rows:
-            return {
-                "mode": segmentation_mode,
-                "processed_frames": 0,
-                "avg_texture_score": avg_texture,
-                "avg_exposure_score": avg_exposure,
-                "avg_usable_area_pct": 0.0,
-                "avg_risk_score": 0.0,
-                "high_risk_frames": 0,
-                "sky_dominant_frames": 0,
-                "dynamic_content_frames": 0,
-                "reflection_problem_frames": 0,
-            }
+            return _empty_summary(mask_mode, avg_texture, avg_exposure)
 
-        avg_usable = round(
-            float(np.mean([row.get("usable_area_pct", 0.0) for row in segmentation_rows])), 3
-        )
-        avg_risk = round(
-            float(np.mean([row.get("photogrammetry_risk_score", 0.0) for row in segmentation_rows])),
-            3,
-        )
-        high_risk = sum(1 for row in segmentation_rows if row.get("risk_level") == "HIGH")
-        sky_dominant = sum(1 for row in segmentation_rows if row.get("sky_pct", 0.0) >= 35.0)
-        dynamic_content = sum(
-            1 for row in segmentation_rows if row.get("dynamic_risk_pct", 0.0) >= 10.0
-        )
-        reflection_problem = sum(
-            1 for row in segmentation_rows if row.get("reflection_pct", 0.0) >= 10.0
-        )
+        avg_usable = round(float(np.mean([r.get("usable_area_pct", 0.0) for r in segmentation_rows])), 3)
+        frames_with_dynamic_mask = len(dynamic_boxes_per_frame)
+        anomaly_reasons = sorted({
+            det.get("reason", "")
+            for dets in dynamic_boxes_per_frame.values()
+            for det in dets
+            if det.get("reason")
+        })
 
         return {
-            "mode": segmentation_mode,
+            "mode": mask_mode,
             "processed_frames": len(segmentation_rows),
             "avg_texture_score": avg_texture,
             "avg_exposure_score": avg_exposure,
             "avg_usable_area_pct": avg_usable,
-            "avg_risk_score": avg_risk,
-            "high_risk_frames": high_risk,
-            "sky_dominant_frames": sky_dominant,
-            "dynamic_content_frames": dynamic_content,
-            "reflection_problem_frames": reflection_problem,
+            "masked_static_categories": sorted(static_categories),
+            "frames_with_dynamic_objects_masked": frames_with_dynamic_mask,
+            "dynamic_anomaly_reasons": anomaly_reasons,
         }
-
-    def _write_segmentation_summary(
-        self,
-        path: Path,
-        rows: List[Dict[str, Any]],
-        mode: str,
-    ) -> None:
-        summary = self._build_semantic_summary(
-            segmentation_rows=rows,
-            segmentation_mode=mode,
-            avg_texture=0.0,
-            avg_exposure=0.0,
-        )
-        try:
-            path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-        except OSError:
-            logger.error("No se pudo escribir %s", path, exc_info=True)
-            raise
 
     def _write_csv(self, path: Path, rows: List[Dict[str, Any]]) -> None:
         if not rows:
             return
-
         fieldnames = list(rows[0].keys())
         try:
             with path.open("w", newline="", encoding="utf-8") as f:
@@ -352,3 +248,16 @@ class SemanticPhase(Phase):
         except OSError:
             logger.error("No se pudo escribir el CSV %s", path, exc_info=True)
             raise
+
+
+def _empty_summary(mode: str, avg_texture: float = 0.0, avg_exposure: float = 0.0) -> Dict[str, Any]:
+    return {
+        "mode": mode,
+        "processed_frames": 0,
+        "avg_texture_score": avg_texture,
+        "avg_exposure_score": avg_exposure,
+        "avg_usable_area_pct": 0.0,
+        "masked_static_categories": [],
+        "frames_with_dynamic_objects_masked": 0,
+        "dynamic_anomaly_reasons": [],
+    }
