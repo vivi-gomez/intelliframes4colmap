@@ -5,11 +5,14 @@ Contrato común para todas las fases del pipeline.
 """
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 
 from .context import PipelineContext
 from .installer import resolve_missing
 from .tool_check import DependencyReport, ToolStatus
+
+logger = logging.getLogger(__name__)
 
 
 class Phase(ABC):
@@ -48,6 +51,7 @@ class Phase(ABC):
         try:
             results = resolve_missing(report.missing, policy)
         except RuntimeError as e:
+            logger.error("[%s] Fallo resolviendo dependencias: %s", self.name, e)
             print(f"[{self.name}] {e}")
             raise
 
@@ -56,6 +60,10 @@ class Phase(ABC):
         still_missing = [t for t in report.missing if not results.get(t.name, False)]
         if still_missing:
             if self.optional:
+                logger.warning(
+                    "[%s] Se salta la fase (opcional): faltan %s",
+                    self.name, [t.name for t in still_missing],
+                )
                 print(f"[{self.name}] Se salta la fase (opcional): faltan {[t.name for t in still_missing]}")
                 ctx.skipped_phases.append(self.name)
                 return False
@@ -64,6 +72,10 @@ class Phase(ABC):
                     f"[{self.name}] Faltan dependencias obligatorias: {[t.name for t in still_missing]}"
                 )
 
-        self.run(ctx)
+        try:
+            self.run(ctx)
+        except Exception as e:
+            logger.error("[%s] Fallo durante la ejecución de la fase: %s", self.name, e, exc_info=True)
+            raise
         ctx.executed_phases.append(self.name)
         return True

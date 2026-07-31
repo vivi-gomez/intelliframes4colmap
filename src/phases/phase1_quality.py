@@ -9,17 +9,21 @@ Implementación real (no simulada) de:
 """
 from __future__ import annotations
 
-import logging
-
 import csv
+import logging
 from pathlib import Path
 
 from ..pipeline.context import PipelineContext
 from ..pipeline.phase import Phase
 from ..pipeline.tool_check import DependencyReport, check_python_package
 
+logger = logging.getLogger(__name__)
+
 SHARPNESS_WINDOW = 31          # sharpnessWindowSize del README
 SHARPNESS_THRESHOLD = 15.0     # por debajo => descartado por desenfoque
+# Rango orientativo de sharpness usado solo para normalizar a 0-100 y poder
+# combinar esta métrica con las de otras fases en el motor de decisión.
+SHARPNESS_NORMALIZATION_CAP = 60.0
 
 
 class QualityPhase(Phase):
@@ -36,29 +40,23 @@ class QualityPhase(Phase):
         )
 
     def run(self, ctx: PipelineContext) -> None:
+        try:
+            self._run(ctx)
+        except Exception:
+            logger.error("Fallo en la fase de calidad", exc_info=True)
+            raise
+
+    def _run(self, ctx: PipelineContext) -> None:
         import cv2
         import numpy as np
-        
-        
-        logging.info("Iniciando ejecución del pipeline")
-        for phase in self.phases:
-            phase_name = phase.__class__.__name__
-            logging.info(f"--- Ejecutando fase: {phase_name} ---")
-            try:
-                phase.execute(self.context)
-                logging.info(f"Fase {phase_name} completada exitosamente")
-            except Exception as e:
-                logging.error(f"Error en fase {phase_name}: {str(e)}", exc_info=True)
-                # Dependiendo de la estrategia, podrías detener o continuar
-                raise  # o break, o manejar según política
-        logging.info("Pipeline finalizado")
-        
-        
+
         if not ctx.frame_list:
             raise RuntimeError("No hay frames cargados; la fase 'ingest' debe ejecutarse antes.")
 
         sharpness_rows = []
         motion_rows = []
+        quality_frame_rows = []
+        unreadable = 0
         orb = cv2.ORB_create(nfeatures=1000)
         prev_gray = None
         prev_kp_des = None
@@ -66,17 +64,29 @@ class QualityPhase(Phase):
         for idx, frame_path in enumerate(ctx.frame_list):
             img = cv2.imread(frame_path)
             if img is None:
+                unreadable += 1
+                logger.warning("Frame ilegible, se omite: %s", frame_path)
                 continue
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-            sharpness = _sharpness_score(gray, SHARPNESS_WINDOW)
+            try:
+                sharpness = _sharpness_score(gray, SHARPNESS_WINDOW)
+            except Exception:
+                logger.warning("No se pudo calcular sharpness para %s", frame_path, exc_info=True)
+                sharpness = 0.0
+
             sharpness_rows.append({"frame": Path(frame_path).name, "sharpness": round(sharpness, 3)})
 
             overlap_pct = None
             flow_magnitude = None
             if prev_gray is not None:
-                flow_magnitude = _mean_optical_flow(prev_gray, gray)
-                overlap_pct = _feature_overlap(orb, prev_kp_des, gray)
+                try:
+                    flow_magnitude = _mean_optical_flow(prev_gray, gray)
+                    overlap_pct = _feature_overlap(orb, prev_kp_des, gray)
+                except Exception:
+                    logger.warning(
+                        "No se pudo calcular motion/overlap para %s", frame_path, exc_info=True
+                    )
 
             motion_rows.append({
                 "frame": Path(frame_path).name,
@@ -84,15 +94,36 @@ class QualityPhase(Phase):
                 "feature_overlap_pct": round(overlap_pct, 2) if overlap_pct is not None else "",
             })
 
+            # Normalizamos sharpness y overlap a 0-100 para que la fase de
+            # decisión pueda combinarlos con otras señales sin conocer sus
+            # escalas originales.
+            quality_score = round(min(100.0, (sharpness / SHARPNESS_NORMALIZATION_CAP) * 100.0), 3)
+            overlap_score = round(overlap_pct, 3) if overlap_pct is not None else None
+            quality_frame_rows.append({
+                "frame": Path(frame_path).name,
+                "sharpness_score": quality_score,
+                "overlap_score": overlap_score,
+                "quality_score": quality_score,
+            })
+
             prev_gray = gray
             prev_kp_des = orb.detectAndCompute(gray, None)
 
             # Clasificación básica: nítido/borroso -> selected/rejected
             dest_dir = ctx.frames_selected_dir if sharpness >= SHARPNESS_THRESHOLD else ctx.frames_rejected_dir
-            _copy_frame(frame_path, dest_dir)
+            try:
+                _copy_frame(frame_path, dest_dir)
+            except OSError:
+                logger.warning("No se pudo copiar el frame %s a %s", frame_path, dest_dir, exc_info=True)
 
             if idx % 5 == 0:
-                _write_thumbnail(cv2, frame_path, ctx.thumbnails_dir)
+                try:
+                    _write_thumbnail(cv2, frame_path, ctx.thumbnails_dir)
+                except Exception:
+                    logger.warning("No se pudo generar thumbnail para %s", frame_path, exc_info=True)
+
+        if unreadable:
+            logger.warning("%d frame(s) ilegibles durante la fase de calidad", unreadable)
 
         _write_csv(ctx.metrics_dir / "sharpness.csv", sharpness_rows, ["frame", "sharpness"])
         _write_csv(
@@ -109,9 +140,14 @@ class QualityPhase(Phase):
             "frames_analyzed": len(sharpness_rows),
             "frames_selected": len(list(ctx.frames_selected_dir.glob("*"))),
             "frames_rejected": len(list(ctx.frames_rejected_dir.glob("*"))),
+            "frames_unreadable": unreadable,
             "avg_sharpness": round(avg_sharpness, 3),
             "avg_feature_overlap_pct": round(avg_overlap, 2) if avg_overlap is not None else None,
             "sharpness_threshold": SHARPNESS_THRESHOLD,
+            # Datos por-frame que consume phase4_decision.py para puntuar
+            # cada frame; antes de esta corrección no se exponían y la
+            # fase de decisión siempre caía en el valor neutro por defecto.
+            "frames": quality_frame_rows,
         }
 
 
@@ -191,7 +227,11 @@ def _write_thumbnail(cv2, frame_path: str, thumb_dir: Path) -> None:
 
 
 def _write_csv(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    try:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+    except OSError:
+        logger.error("No se pudo escribir el CSV %s", path, exc_info=True)
+        raise

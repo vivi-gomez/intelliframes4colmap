@@ -7,14 +7,16 @@ directamente. Nada aquí está simulado.
 """
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import subprocess
 from pathlib import Path
 
 from ..pipeline.context import PipelineContext
 from ..pipeline.phase import Phase
 from ..pipeline.tool_check import DependencyReport, check_binary
+
+logger = logging.getLogger(__name__)
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".mts", ".m4v"}
@@ -31,28 +33,36 @@ class IngestPhase(Phase):
         )
 
     def run(self, ctx: PipelineContext) -> None:
+        """
+        Punto de entrada de la fase. El control de errores de alto nivel
+        (si la fase debe abortar el pipeline o no) lo hace el runner; aquí
+        solo registramos contexto útil para depurar en logs/ antes de
+        relanzar la excepción.
+        """
         input_path = ctx.input_path
-        logging.info("Iniciando ejecución del pipeline")
-        for phase in self.phases:
-            phase_name = phase.__class__.__name__
-            logging.info(f"--- Ejecutando fase: {phase_name} ---")
-            try:
-                phase.execute(self.context)
-                logging.info(f"Fase {phase_name} completada exitosamente")
-            except Exception as e:
-                logging.error(f"Error en fase {phase_name}: {str(e)}", exc_info=True)
-                # Dependiendo de la estrategia, podrías detener o continuar
-                raise  # o break, o manejar según política
-        logging.info("Pipeline finalizado")
+        logger.info("Ingesta: input=%s", input_path)
 
-        if input_path.is_dir():
-            self._ingest_image_folder(ctx, input_path)
-        elif input_path.suffix.lower() in VIDEO_EXTS:
-            self._ingest_video(ctx, input_path)
-        elif input_path.suffix.lower() in IMAGE_EXTS:
-            self._ingest_image_folder(ctx, input_path.parent)
-        else:
-            raise RuntimeError(f"Tipo de entrada no reconocido: {input_path}")
+        try:
+            if not input_path.exists():
+                raise RuntimeError(f"La ruta de entrada no existe: {input_path}")
+
+            if input_path.is_dir():
+                self._ingest_image_folder(ctx, input_path)
+            elif input_path.suffix.lower() in VIDEO_EXTS:
+                self._ingest_video(ctx, input_path)
+            elif input_path.suffix.lower() in IMAGE_EXTS:
+                self._ingest_image_folder(ctx, input_path.parent)
+            else:
+                raise RuntimeError(f"Tipo de entrada no reconocido: {input_path}")
+        except Exception:
+            logger.error("Fallo en la fase de ingesta con input=%s", input_path, exc_info=True)
+            raise
+
+        logger.info(
+            "Ingesta completada: %d frames disponibles (%s)",
+            len(ctx.frame_list),
+            ctx.metadata.get("source_type", "desconocido"),
+        )
 
     def _ingest_video(self, ctx: PipelineContext, video_path: Path) -> None:
         ctx.metadata = _probe_video(video_path)
@@ -67,11 +77,20 @@ class IngestPhase(Phase):
             cmd += ["-vf", f"fps={sample_fps}"]
         cmd += [pattern]
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        logger.debug("Ejecutando ffmpeg: %s", " ".join(cmd))
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"ffmpeg excedió el tiempo límite extrayendo frames: {exc}") from exc
+
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg falló extrayendo frames:\n{result.stderr[-1000:]}")
 
         ctx.frame_list = sorted(str(p) for p in ctx.frames_dir.glob("frame_*.png"))
+        if not ctx.frame_list:
+            raise RuntimeError(
+                f"ffmpeg no produjo ningún frame en {ctx.frames_dir}; revisa el video de entrada."
+            )
         ctx.metadata["frames_extracted"] = len(ctx.frame_list)
 
     def _ingest_image_folder(self, ctx: PipelineContext, folder: Path) -> None:
@@ -97,12 +116,19 @@ def _probe_video(video_path: Path) -> dict:
         "-of", "json",
         str(video_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"ffprobe excedió el tiempo límite: {exc}") from exc
+
     if result.returncode != 0:
         raise RuntimeError(f"ffprobe falló:\n{result.stderr[-1000:]}")
 
-    data = json.loads(result.stdout)
-    stream = data["streams"][0]
+    try:
+        data = json.loads(result.stdout)
+        stream = data["streams"][0]
+    except (json.JSONDecodeError, KeyError, IndexError) as exc:
+        raise RuntimeError(f"No se pudo interpretar la salida de ffprobe: {exc}") from exc
 
     fps_str = stream.get("r_frame_rate", "0/1")
     num, den = (int(x) for x in fps_str.split("/"))

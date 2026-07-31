@@ -3,16 +3,17 @@ Fase 2 — Análisis semántico
 
 - Texture richness y exposición: reales, solo necesitan OpenCV/numpy (ya
   requeridos en fase 1), así que siempre se calculan.
-- Segmentación (SAM / YOLO): pesada (requiere torch + checkpoints de varios
-  cientos de MB). Es opcional: si no está disponible, esta sub-parte se salta
-  y se registra en el manifest, pero el resto de la fase sí se ejecuta.
+- Segmentación (SAM / clásica / YOLO para personas y vehículos): pesada
+  (SAM requiere torch + checkpoints de varios cientos de MB, YOLO requiere
+  ultralytics). Es opcional en el sentido de que si algún backend no está
+  disponible, se degrada de forma controlada; el resto de la fase sí se
+  ejecuta siempre.
 """
 from __future__ import annotations
 
-import logging
-
 import csv
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -23,13 +24,16 @@ from ..pipeline.context import PipelineContext
 from ..pipeline.phase import Phase
 from ..pipeline.tool_check import DependencyReport, check_python_package
 
+logger = logging.getLogger(__name__)
+
 
 class SemanticPhase(Phase):
     """
     Fase 2: análisis semántico ligero y segmentación.
     - siempre calcula textura + exposición
     - intenta segmentación con SAM si está disponible
-    - si no, usa fallback clásico
+    - si no, usa fallback clásico (que a su vez intenta YOLO para
+      personas/vehículos y degrada a máscara vacía si tampoco está)
     - si falla todo, no rompe el pipeline
     """
 
@@ -46,22 +50,16 @@ class SemanticPhase(Phase):
         )
 
     def run(self, ctx: PipelineContext) -> None:
-	logging.info("Iniciando ejecución del pipeline")
-        for phase in self.phases:
-            phase_name = phase.__class__.__name__
-            logging.info(f"--- Ejecutando fase: {phase_name} ---")
-            try:
-                phase.execute(self.context)
-                logging.info(f"Fase {phase_name} completada exitosamente")
-            except Exception as e:
-                logging.error(f"Error en fase {phase_name}: {str(e)}", exc_info=True)
-                # Dependiendo de la estrategia, podrías detener o continuar
-                raise  # o break, o manejar según política
-        logging.info("Pipeline finalizado")
-        
-    def run(self, ctx) -> None:
+        try:
+            self._run(ctx)
+        except Exception:
+            logger.error("Fallo en la fase semántica", exc_info=True)
+            raise
+
+    def _run(self, ctx: PipelineContext) -> None:
         frames = list(getattr(ctx, "frame_list", []) or [])
         if not frames:
+            logger.warning("Fase semántica: no hay frames, se omite el análisis.")
             ctx.metrics.setdefault("semantic", {})
             ctx.metrics["semantic"]["status"] = "skipped_no_frames"
             ctx.semantic = {
@@ -144,6 +142,7 @@ class SemanticPhase(Phase):
         for frame_path in frames:
             img = cv2.imread(str(frame_path), cv2.IMREAD_GRAYSCALE)
             if img is None:
+                logger.warning("Frame ilegible en cálculo de textura: %s", frame_path)
                 rows.append(
                     {
                         "frame": Path(frame_path).name,
@@ -180,6 +179,7 @@ class SemanticPhase(Phase):
         for frame_path in frames:
             img = cv2.imread(str(frame_path), cv2.IMREAD_GRAYSCALE)
             if img is None:
+                logger.warning("Frame ilegible en cálculo de exposición: %s", frame_path)
                 rows.append(
                     {
                         "frame": Path(frame_path).name,
@@ -236,6 +236,7 @@ class SemanticPhase(Phase):
                 dep_log["segmentation"] = "sam"
                 return rows, "sam"
         except Exception as exc:
+            logger.info("Segmentación SAM no disponible (%s); se usa fallback clásico.", exc)
             dep_log["sam_error"] = str(exc)
 
         try:
@@ -250,6 +251,7 @@ class SemanticPhase(Phase):
             dep_log["segmentation"] = "classical"
             return rows, "classical"
         except Exception as exc:
+            logger.error("Segmentación clásica también falló; se omite la segmentación.", exc_info=True)
             dep_log["segmentation"] = "skipped"
             dep_log["segmentation_error"] = str(exc)
             return [], "none"
@@ -331,14 +333,22 @@ class SemanticPhase(Phase):
             avg_texture=0.0,
             avg_exposure=0.0,
         )
-        path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        try:
+            path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            logger.error("No se pudo escribir %s", path, exc_info=True)
+            raise
 
     def _write_csv(self, path: Path, rows: List[Dict[str, Any]]) -> None:
         if not rows:
             return
 
         fieldnames = list(rows[0].keys())
-        with path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
+        try:
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+        except OSError:
+            logger.error("No se pudo escribir el CSV %s", path, exc_info=True)
+            raise

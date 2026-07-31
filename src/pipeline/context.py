@@ -21,6 +21,12 @@ class PipelineContext:
     unattended: bool = False
     on_missing_dep: str = "install"      # "install" | "skip" | "fail"
 
+    # Ruta opcional a un archivo de telemetría GNSS/IMU externo
+    # (.gpx, .csv, .log) usado por la fase de sincronización geoespacial.
+    telemetry_path: Path | None = None
+    # Ruta opcional a un checkpoint de SAM ya descargado.
+    sam_checkpoint: Path | None = None
+
     # Rutas de trabajo (se crean bajo demanda)
     frames_dir: Path = None
     frames_selected_dir: Path = None

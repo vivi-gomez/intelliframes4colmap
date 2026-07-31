@@ -1,44 +1,70 @@
-import logging
-import os
-from datetime import datetime
-
-def setup_logging(input_file: str = None):
-    # Crear carpeta logs si no existe
-    log_dir = "logs"
-    os.makedirs(log_dir, exist_ok=True)
-    
-    # Nombre del archivo de log con timestamp y (opcional) nombre del input
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_name = os.path.splitext(os.path.basename(input_file))[0] if input_file else "no_input"
-    log_filename = f"{log_dir}/{timestamp}_{base_name}.log"
-    
-    # Configurar logging básico: nivel INFO, formato con fecha-hora
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_filename, encoding='utf-8'),
-            logging.StreamHandler()  # También muestra en consola
-        ]
-    )
-    # Log de inicio
-    logging.info(f"Iniciando pipeline para input: {input_file}")
-    return log_filename
-
-
-
 from __future__ import annotations
 
+import argparse
+import logging
+import sys
 from pathlib import Path
 
 from src.pipeline.context import PipelineContext
+from src.pipeline.logging_setup import setup_logging
 from src.pipeline.runner import PipelineRunner
-from src.phases.phase0-ingest import IngestPhase
-from src.phases.phase1-quality import QualityPhase
-from src.phases.phase2-semantic import SemanticPhase
-from src.phases.phase3-geospatial import GeospatialPhase
-from src.phases.phase4-decision import DecisionPhase
-from src.phases.phase5-report import ReportPhase
+from src.phases.phase0_ingest import IngestPhase
+from src.phases.phase1_quality import QualityPhase
+from src.phases.phase2_semantic import SemanticPhase
+from src.phases.phase3_geospatial import GeospatialPhase
+from src.phases.phase4_decision import DecisionPhase
+from src.phases.phase5_report import ReportPhase
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="intelliframes4colmap - análisis inteligente de fotogramas previo a COLMAP",
+    )
+    parser.add_argument(
+        "input",
+        nargs="?",
+        default="input",
+        help="Ruta de entrada: video o carpeta de imágenes (por defecto: ./input)",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        default="output",
+        help="Carpeta de salida (por defecto: ./output)",
+    )
+    parser.add_argument(
+        "--telemetry",
+        default=None,
+        help="Ruta opcional a un archivo de telemetría GNSS/IMU (.gpx, .csv, .log)",
+    )
+    parser.add_argument(
+        "--unattended",
+        action="store_true",
+        help="No preguntar nada por consola; aplica --on-missing-dep automáticamente",
+    )
+    parser.add_argument(
+        "--on-missing-dep",
+        choices=["install", "skip", "fail"],
+        default="install",
+        help="Qué hacer cuando falta una dependencia de una fase (por defecto: install)",
+    )
+    parser.add_argument(
+        "--only-phases",
+        nargs="*",
+        default=None,
+        help="Ejecutar solo estas fases (por nombre), ej: --only-phases ingest quality",
+    )
+    parser.add_argument(
+        "--skip-phases",
+        nargs="*",
+        default=None,
+        help="Saltar estas fases (por nombre)",
+    )
+    parser.add_argument(
+        "--log-dir",
+        default="logs",
+        help="Carpeta donde se escriben los logs de ejecución (por defecto: ./logs)",
+    )
+    return parser.parse_args(argv)
 
 
 def build_runner() -> PipelineRunner:
@@ -52,32 +78,39 @@ def build_runner() -> PipelineRunner:
     ])
 
 
-def main() -> None:
-    input_path = Path("input")
-    output_dir = Path("output")
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    log_file = setup_logging(input_name=args.input, log_dir=args.log_dir)
+
+    logging.info("Iniciando pipeline para input: %s", args.input)
 
     ctx = PipelineContext(
-        input_path=input_path,
-        output_dir=output_dir,
-        unattended=False,
-        on_missing_dep="install",
+        input_path=Path(args.input),
+        output_dir=Path(args.output),
+        unattended=args.unattended,
+        on_missing_dep=args.on_missing_dep,
     )
+    if args.telemetry:
+        ctx.telemetry_path = Path(args.telemetry)
 
     runner = build_runner()
-    runner.run(ctx)
+
+    try:
+        runner.run(
+            ctx,
+            only_phases=set(args.only_phases) if args.only_phases else None,
+            skip_phases=set(args.skip_phases) if args.skip_phases else None,
+        )
+    except Exception:
+        # Cualquier error no controlado por una fase concreta llega aquí.
+        # Se deja constancia completa (traceback) en el log en disco.
+        logging.critical("Error fatal no capturado. Pipeline abortado.", exc_info=True)
+        return 1
+    finally:
+        logging.info("Pipeline finalizado. Log guardado en: %s", log_file)
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
-    args = parse_args()  # asumiendo que existe
-    log_file = setup_logging(args.input)
-    try:
-        pipeline = PipelineRunner(...)
-        pipeline.run()
-    except Exception as e:
-        logging.critical("Error fatal no capturado", exc_info=True)
-        sys.exit(1)
-    finally:
-        logging.info(f"Pipeline finalizado. Log guardado en {log_file}")
-        
-python        
+    sys.exit(main())

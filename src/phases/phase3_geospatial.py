@@ -1,83 +1,71 @@
-    """
-    Fase 3: análisis geoespacial y de telemetría ligera.
+"""
+Fase 3 — Análisis geoespacial y de telemetría
 
-    Objetivos:
-    - Leer metadatos geoespaciales desde los frames seleccionados.
-    - Detectar si existe información GNSS utilizable.
-    - Detectar si existe información tipo IMU/orientación si está disponible.
-    - Estimar cobertura espacial básica del conjunto.
-    - Generar métricas exportables para fases posteriores.
+Objetivos:
+- Leer metadatos geoespaciales desde los frames seleccionados (EXIF).
+- Si el usuario aporta un archivo de telemetría externo (GPX/CSV/LOG,
+  ver --telemetry), sincronizarlo a cada frame mediante Spline Cúbica
+  (sección 2.5 del README) y convertir a coordenadas cartesianas locales.
+- Detectar si existe información GNSS/IMU utilizable.
+- Estimar cobertura espacial básica del conjunto.
+- Generar métricas exportables para fases posteriores.
 
-    Salidas principales:
-    - metrics/geospatial.csv
-    - metrics/geospatial_summary.json
-    - ctx.geospatial
-    - ctx.metrics["geospatial"]
+Salidas principales:
+- metrics/geospatial.csv
+- metrics/geospatial_summary.json
+- ctx.geospatial
+- ctx.metrics["geospatial"]
 
-    Notas:
-    - No aborta el pipeline si no encuentra GPS/IMU.
-    - Prioriza EXIF estándar.
-    - Puede ampliarse más adelante con sidecars, logs de vuelo o sensores externos.
-    """
-
+Notas:
+- No aborta el pipeline si no encuentra GPS/IMU ni telemetría externa.
+- Prioriza EXIF estándar por frame; si un frame no tiene EXIF GPS pero sí
+  hay telemetría externa sincronizada, se usa esta última.
+"""
 from __future__ import annotations
-
-import logging
 
 import csv
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..pipeline.context import PipelineContext
 from ..pipeline.phase import Phase
+from ..pipeline.tool_check import DependencyReport, check_python_package
+from ._telemetry_sync import TelemetryError, geodetic_to_local_enu, load_telemetry, sync_to_frame_times
+
+logger = logging.getLogger(__name__)
 
 
 class GeospatialPhase(Phase):
+    """
+    Fase 3: análisis geoespacial y de telemetría ligera.
+    """
 
+    name = "geospatial"
+    optional = True  # el pipeline puede seguir aunque no haya GPS/IMU/telemetría
 
-    def __init__(self) -> None:
-        super().__init__("phase3-geospatial")
-
-    def check_dependencies(self) -> bool:
+    def check_dependencies(self) -> DependencyReport:
         """
-        Comprueba dependencias mínimas para esta fase.
-
-        Esta fase intenta usar Pillow para leer EXIF de imágenes.
-        Si no está disponible, la fase puede marcarse como no ejecutable.
+        Esta fase intenta usar Pillow para leer EXIF de imágenes. Si no
+        está disponible, se reporta como dependencia faltante y, al ser
+        una fase opcional, el pipeline la saltará en vez de abortar.
         """
+        return DependencyReport(
+            phase_name=self.name,
+            checks=[check_python_package("PIL", "Pillow")],
+        )
+
+    def run(self, ctx: PipelineContext) -> None:
         try:
-            from PIL import Image  # noqa: F401
-            from PIL.ExifTags import GPSTAGS, TAGS  # noqa: F401
-        except Exception as exc:
-            self._last_dependency_error = f"Missing geospatial deps: {exc}"
-            return False
+            self._run(ctx)
+        except Exception:
+            logger.error("Fallo en la fase geoespacial", exc_info=True)
+            raise
 
-        return True
-
-    def run(self, ctx) -> None:
-        logging.info("Iniciando ejecución del pipeline")
-        for phase in self.phases:
-            phase_name = phase.__class__.__name__
-            logging.info(f"--- Ejecutando fase: {phase_name} ---")
-            try:
-                phase.execute(self.context)
-                logging.info(f"Fase {phase_name} completada exitosamente")
-            except Exception as e:
-                logging.error(f"Error en fase {phase_name}: {str(e)}", exc_info=True)
-                # Dependiendo de la estrategia, podrías detener o continuar
-                raise  # o break, o manejar según política
-        logging.info("Pipeline finalizado")
-        
-        
+    def _run(self, ctx: PipelineContext) -> None:
         """
         Ejecuta el análisis geoespacial sobre los frames disponibles.
-
-        Comportamiento:
-        - Recorre ctx.frame_list.
-        - Intenta extraer EXIF GPS y orientación básica.
-        - Calcula cobertura, caja envolvente y calidad básica de telemetría.
-        - Escribe resultados estructurados en contexto y en disco.
         """
         frames = list(getattr(ctx, "frame_list", []) or [])
         metrics_dir = Path(ctx.metrics_dir)
@@ -103,16 +91,23 @@ class GeospatialPhase(Phase):
             row = self._extract_frame_geodata(frame_path)
             rows.append(row)
 
+        telemetry_info = self._sync_external_telemetry(ctx, frames, rows)
+
         csv_path = metrics_dir / "geospatial.csv"
         self._write_csv(csv_path, rows)
 
         summary = self._build_summary(rows)
+        summary["telemetry"] = telemetry_info
 
         summary_path = metrics_dir / "geospatial_summary.json"
-        summary_path.write_text(
-            json.dumps(summary, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        try:
+            summary_path.write_text(
+                json.dumps(summary, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            logger.error("No se pudo escribir %s", summary_path, exc_info=True)
+            raise
 
         ctx.geospatial = {
             "frames": rows,
@@ -134,18 +129,159 @@ class GeospatialPhase(Phase):
                 "processed_frames": summary["processed_frames"],
                 "frames_with_gps": summary["frames_with_gps"],
                 "frames_with_imu": summary["frames_with_imu"],
+                "telemetry_source": telemetry_info["source"],
             }
         )
+
+    # ------------------------------------------------------------------
+    # Sincronización GNSS/IMU externa (README 2.5)
+    # ------------------------------------------------------------------
+
+    def _sync_external_telemetry(
+        self,
+        ctx: PipelineContext,
+        frames: List[str],
+        rows: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Si ctx.telemetry_path apunta a un archivo GPX/CSV/LOG, lo carga,
+        lo sincroniza a cada frame mediante spline cúbica y rellena en
+        `rows` los frames que no tenían GPS/IMU vía EXIF.
+
+        Cualquier fallo (archivo inválido, formato no reconocido, tiempos
+        no calculables) se registra en el log y en ctx.dependency_log, y
+        la fase continúa solo con los datos EXIF ya extraídos: nunca
+        rompe el pipeline por un problema de telemetría externa.
+        """
+        dep_log = ctx.dependency_log.setdefault(self.name, {})
+        telemetry_path = getattr(ctx, "telemetry_path", None)
+
+        info: Dict[str, Any] = {
+            "source": "none",
+            "samples": 0,
+            "frames_filled_from_telemetry": 0,
+        }
+
+        if not telemetry_path:
+            return info
+
+        try:
+            samples = load_telemetry(telemetry_path)
+            frame_times = self._estimate_frame_times(ctx, frames, rows)
+            synced = sync_to_frame_times(samples, frame_times)
+
+            origin = next((s for s in synced if s.get("lat") is not None), None)
+            filled = 0
+            for row, sync_row in zip(rows, synced):
+                if sync_row.get("lat") is None or sync_row.get("lon") is None:
+                    continue
+                if not row.get("has_gps"):
+                    row["has_gps"] = True
+                    row["latitude"] = round(sync_row["lat"], 8)
+                    row["longitude"] = round(sync_row["lon"], 8)
+                    if sync_row.get("alt") is not None:
+                        row["altitude_m"] = round(sync_row["alt"], 3)
+                    row["telemetry_quality"] = (
+                        "PARTIAL" if sync_row.get("extrapolated") else "GOOD"
+                    )
+                    filled += 1
+                if not row.get("has_imu"):
+                    if sync_row.get("yaw") is not None:
+                        row["heading_deg"] = round(sync_row["yaw"], 3)
+                        row["has_imu"] = True
+                    if sync_row.get("pitch") is not None:
+                        row["pitch_deg"] = round(sync_row["pitch"], 3)
+                        row["has_imu"] = True
+                    if sync_row.get("roll") is not None:
+                        row["roll_deg"] = round(sync_row["roll"], 3)
+                        row["has_imu"] = True
+
+                if origin is not None:
+                    local = geodetic_to_local_enu(
+                        lat=sync_row["lat"], lon=sync_row["lon"], alt=sync_row.get("alt"),
+                        origin_lat=origin["lat"], origin_lon=origin["lon"], origin_alt=origin.get("alt"),
+                    )
+                    row.update(local)
+
+            info.update(
+                {
+                    "source": Path(telemetry_path).suffix.lower().lstrip("."),
+                    "samples": len(samples),
+                    "frames_filled_from_telemetry": filled,
+                }
+            )
+            dep_log["telemetry"] = "synced"
+            logger.info(
+                "Telemetría externa sincronizada: %d muestras, %d frames completados.",
+                len(samples), filled,
+            )
+        except TelemetryError as exc:
+            logger.warning("Telemetría externa no usable (%s); se continúa solo con EXIF.", exc)
+            dep_log["telemetry_error"] = str(exc)
+        except Exception as exc:
+            logger.error("Fallo inesperado sincronizando telemetría externa.", exc_info=True)
+            dep_log["telemetry_error"] = str(exc)
+
+        return info
+
+    def _estimate_frame_times(
+        self,
+        ctx: PipelineContext,
+        frames: List[str],
+        rows: List[Dict[str, Any]],
+    ) -> List[float]:
+        """
+        Estima el tiempo (en segundos, relativo al primer frame) de cada
+        frame para poder interpolar la telemetría sobre él.
+
+        - Si el video fue extraído por ffmpeg y conocemos el FPS de
+          muestreo (ctx.metadata["fps"]), se usa índice/fps: es exacto
+          porque ffmpeg extrae frames a intervalos regulares.
+        - Si no (carpeta de imágenes sueltas), se usan los timestamps
+          EXIF ya extraídos por frame cuando existen.
+        - Si no hay ninguna de las dos cosas, se asume 1 frame/segundo y
+          se registra que la sincronización será aproximada.
+        """
+        fps = (ctx.metadata or {}).get("fps")
+        if fps and fps > 0:
+            return [i / float(fps) for i in range(len(frames))]
+
+        timestamps = [row.get("timestamp") for row in rows]
+        if any(timestamps):
+            parsed = []
+            for ts in timestamps:
+                parsed.append(self._parse_exif_seconds(ts))
+            valid = [p for p in parsed if p is not None]
+            if valid:
+                t0 = min(valid)
+                return [p - t0 if p is not None else float(i) for i, p in enumerate(parsed)]
+
+        logger.warning(
+            "No hay FPS ni timestamps EXIF disponibles; se asume 1 frame/segundo "
+            "para sincronizar telemetría (aproximado)."
+        )
+        return [float(i) for i in range(len(frames))]
+
+    @staticmethod
+    def _parse_exif_seconds(timestamp: Optional[str]) -> Optional[float]:
+        if not timestamp:
+            return None
+        from datetime import datetime
+
+        for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.strptime(timestamp[:19], fmt).timestamp()
+            except ValueError:
+                continue
+        return None
+
+    # ------------------------------------------------------------------
+    # Extracción EXIF por frame
+    # ------------------------------------------------------------------
 
     def _extract_frame_geodata(self, frame_path: str) -> Dict[str, Any]:
         """
         Extrae metadatos geoespaciales de un frame individual.
-
-        Campos buscados:
-        - latitud / longitud
-        - altitud
-        - rumbo/orientación si existe
-        - timestamp EXIF si existe
 
         Si el frame no tiene metadatos útiles, devuelve una fila válida
         con indicadores vacíos y estado legible.
@@ -230,19 +366,13 @@ class GeospatialPhase(Phase):
             return base_row
 
         except Exception as exc:
+            logger.debug("No se pudo leer EXIF de %s: %s", frame_path, exc)
             base_row["error"] = f"read_error: {exc}"
             return base_row
 
     def _build_summary(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Construye el resumen geoespacial global.
-
-        Incluye:
-        - disponibilidad de GPS e IMU
-        - número de frames con telemetría
-        - caja envolvente espacial
-        - cobertura estimada
-        - distancia secuencial aproximada
         """
         processed_frames = len(rows)
         gps_rows = [r for r in rows if r.get("has_gps")]
@@ -276,6 +406,11 @@ class GeospatialPhase(Phase):
         """
         Devuelve un resumen vacío para casos en los que no hay datos.
         """
+        empty_bbox = {
+            "min_lat": None, "max_lat": None,
+            "min_lon": None, "max_lon": None,
+            "min_alt_m": None, "max_alt_m": None,
+        }
         return {
             "frames": [],
             "summary": {
@@ -286,39 +421,18 @@ class GeospatialPhase(Phase):
                 "gps_available": False,
                 "imu_available": False,
                 "coverage": "none",
-                "bbox": {
-                    "min_lat": None,
-                    "max_lat": None,
-                    "min_lon": None,
-                    "max_lon": None,
-                    "min_alt_m": None,
-                    "max_alt_m": None,
-                },
+                "bbox": empty_bbox,
                 "approx_path_distance_m": 0.0,
-                "telemetry_quality_counts": {
-                    "good": 0,
-                    "partial": 0,
-                    "poor": 0,
-                    "none": 0,
-                },
+                "telemetry_quality_counts": {"good": 0, "partial": 0, "poor": 0, "none": 0},
+                "telemetry": {"source": "none", "samples": 0, "frames_filled_from_telemetry": 0},
             },
             "coverage": "none",
             "gps_available": False,
             "imu_available": False,
-            "bbox": {
-                "min_lat": None,
-                "max_lat": None,
-                "min_lon": None,
-                "max_lon": None,
-                "min_alt_m": None,
-                "max_alt_m": None,
-            },
+            "bbox": empty_bbox,
         }
 
     def _extract_lat_lon(self, gps_info: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-        """
-        Convierte coordenadas EXIF GPS a grados decimales.
-        """
         try:
             lat = gps_info.get("GPSLatitude")
             lat_ref = gps_info.get("GPSLatitudeRef")
@@ -335,9 +449,6 @@ class GeospatialPhase(Phase):
             return None, None
 
     def _extract_altitude(self, gps_info: Dict[str, Any]) -> Optional[float]:
-        """
-        Extrae la altitud si está disponible.
-        """
         try:
             alt = gps_info.get("GPSAltitude")
             alt_ref = gps_info.get("GPSAltitudeRef", 0)
@@ -357,9 +468,6 @@ class GeospatialPhase(Phase):
             return None
 
     def _extract_gps_dop(self, gps_info: Dict[str, Any]) -> Optional[float]:
-        """
-        Extrae el DOP GPS si existe.
-        """
         try:
             dop = gps_info.get("GPSDOP")
             return self._rational_to_float(dop)
@@ -371,18 +479,11 @@ class GeospatialPhase(Phase):
         gps_info: Dict[str, Any],
         exif_data: Dict[str, Any],
     ) -> Optional[float]:
-        """
-        Extrae rumbo/orientación si está disponible.
-
-        Se prioriza GPSImgDirection y luego campos EXIF equivalentes
-        si más adelante aparecen en ciertos dispositivos.
-        """
         try:
             heading = gps_info.get("GPSImgDirection")
             if heading is not None:
                 return self._rational_to_float(heading)
 
-            # Posibles extensiones futuras de fabricantes.
             for key in ("ImageDirection", "CameraHeading", "Heading"):
                 if key in exif_data:
                     return self._rational_to_float(exif_data[key])
@@ -392,18 +493,12 @@ class GeospatialPhase(Phase):
             return None
 
     def _extract_pitch(self, exif_data: Dict[str, Any]) -> Optional[float]:
-        """
-        Extrae pitch si existe en EXIF extendido de algún fabricante.
-        """
         for key in ("CameraPitch", "Pitch", "GimbalPitchDegree"):
             if key in exif_data:
                 return self._rational_to_float(exif_data[key])
         return None
 
     def _extract_roll(self, exif_data: Dict[str, Any]) -> Optional[float]:
-        """
-        Extrae roll si existe en EXIF extendido de algún fabricante.
-        """
         for key in ("CameraRoll", "Roll", "GimbalRollDegree"):
             if key in exif_data:
                 return self._rational_to_float(exif_data[key])
@@ -414,9 +509,6 @@ class GeospatialPhase(Phase):
         exif_data: Dict[str, Any],
         gps_info: Dict[str, Any],
     ) -> Optional[str]:
-        """
-        Extrae timestamp desde EXIF o GPS time/date si existe.
-        """
         for key in ("DateTimeOriginal", "DateTime", "DateTimeDigitized"):
             if key in exif_data and exif_data[key]:
                 return str(exif_data[key])
@@ -442,23 +534,6 @@ class GeospatialPhase(Phase):
         dop: Optional[float],
         has_imu: bool,
     ) -> str:
-        """
-        Clasifica la calidad de telemetría de forma simple.
-
-        GOOD:
-        - GPS disponible
-        - y además altitud o IMU, con DOP razonable o desconocido
-
-        PARTIAL:
-        - GPS disponible pero incompleto
-        - o IMU sin GPS
-
-        POOR:
-        - datos presentes pero débiles
-
-        NONE:
-        - sin telemetría
-        """
         if not has_gps and not has_imu:
             return "NONE"
 
@@ -473,17 +548,11 @@ class GeospatialPhase(Phase):
         return "NONE"
 
     def _compute_bbox(self, gps_rows: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
-        """
-        Calcula la caja envolvente espacial del conjunto con GPS.
-        """
         if not gps_rows:
             return {
-                "min_lat": None,
-                "max_lat": None,
-                "min_lon": None,
-                "max_lon": None,
-                "min_alt_m": None,
-                "max_alt_m": None,
+                "min_lat": None, "max_lat": None,
+                "min_lon": None, "max_lon": None,
+                "min_alt_m": None, "max_alt_m": None,
             }
 
         lats = [float(r["latitude"]) for r in gps_rows if r.get("latitude") != ""]
@@ -500,10 +569,6 @@ class GeospatialPhase(Phase):
         }
 
     def _compute_path_distance(self, gps_rows: List[Dict[str, Any]]) -> float:
-        """
-        Estima la distancia recorrida sumando distancias entre frames
-        consecutivos que tengan GPS.
-        """
         if len(gps_rows) < 2:
             return 0.0
 
@@ -524,9 +589,6 @@ class GeospatialPhase(Phase):
         bbox: Dict[str, Optional[float]],
         approx_path_distance_m: float,
     ) -> str:
-        """
-        Clasifica la cobertura espacial de forma heurística.
-        """
         if not gps_rows:
             return "none"
 
@@ -553,15 +615,9 @@ class GeospatialPhase(Phase):
         return "moderate"
 
     def _make_bbox_cell(self, lat: float, lon: float, decimals: int = 4) -> str:
-        """
-        Agrupa coordenadas en una celda textual simple para análisis básico.
-        """
         return f"{round(lat, decimals)}|{round(lon, decimals)}"
 
     def _dms_to_decimal(self, dms: Any, ref: str) -> Optional[float]:
-        """
-        Convierte coordenadas EXIF en formato grados/minutos/segundos a decimal.
-        """
         try:
             degrees = self._rational_to_float(dms[0])
             minutes = self._rational_to_float(dms[1])
@@ -580,14 +636,6 @@ class GeospatialPhase(Phase):
             return None
 
     def _rational_to_float(self, value: Any) -> Optional[float]:
-        """
-        Convierte valores EXIF racionales a float.
-
-        Soporta:
-        - enteros y floats
-        - tuplas tipo (num, den)
-        - objetos con atributos numerator/denominator
-        """
         if value is None:
             return None
 
@@ -619,9 +667,6 @@ class GeospatialPhase(Phase):
         lat2: float,
         lon2: float,
     ) -> float:
-        """
-        Distancia Haversine en metros entre dos coordenadas.
-        """
         from math import asin, cos, radians, sin, sqrt
 
         r = 6371000.0
@@ -637,14 +682,15 @@ class GeospatialPhase(Phase):
         return r * c
 
     def _write_csv(self, path: Path, rows: List[Dict[str, Any]]) -> None:
-        """
-        Escribe un CSV simple con las filas generadas.
-        """
         if not rows:
             return
 
-        fieldnames = list(rows[0].keys())
-        with path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
+        fieldnames = sorted({key for row in rows for key in row.keys()})
+        try:
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+        except OSError:
+            logger.error("No se pudo escribir el CSV %s", path, exc_info=True)
+            raise

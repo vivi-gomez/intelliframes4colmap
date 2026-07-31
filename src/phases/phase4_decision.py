@@ -1,42 +1,46 @@
 """
-    Fase 4: motor de decisión para preparar una configuración recomendada
-    de COLMAP a partir de métricas de calidad, semántica y geoespaciales.
+Fase 4 — Motor de decisión
 
-    Objetivos:
-    - Consolidar señales de fases anteriores.
-    - Estimar si el conjunto es apto para una reconstrucción estable.
-    - Proponer una configuración razonable para COLMAP.
-    - Generar artefactos simples y trazables para la siguiente fase.
+Prepara una configuración recomendada de COLMAP a partir de métricas de
+calidad, semántica y geoespaciales.
 
-    Entradas esperadas:
-    - ctx.frame_list
-    - ctx.metrics["quality"]              (si existe)
-    - ctx.metrics["semantic"]             (si existe)
-    - ctx.semantic                        (si existe)
-    - ctx.geospatial                      (si existe)
+Objetivos:
+- Consolidar señales de fases anteriores.
+- Estimar si el conjunto es apto para una reconstrucción estable.
+- Proponer una configuración razonable para COLMAP.
+- Generar artefactos simples y trazables para la siguiente fase.
 
-    Salidas principales:
-    - colmap/colmap_config.json
-    - colmap/frames_for_colmap.txt
-    - colmap/decision_summary.json
-    - ctx.decision
-    - ctx.metrics["decision"]
+Entradas esperadas:
+- ctx.frame_list
+- ctx.metrics["quality"]              (si existe)
+- ctx.metrics["semantic"]             (si existe)
+- ctx.semantic                        (si existe)
+- ctx.geospatial                      (si existe)
 
-    Notas:
-    - No modifica físicamente los frames.
-    - No ejecuta COLMAP; solo recomienda configuración y selección.
-    - Debe degradar con elegancia si faltan métricas previas.
+Salidas principales:
+- colmap/colmap_config.json
+- colmap/frames_for_colmap.txt
+- colmap/decision_summary.json
+- ctx.decision
+- ctx.metrics["decision"]
+
+Notas:
+- No modifica físicamente los frames.
+- No ejecuta COLMAP; solo recomienda configuración y selección.
+- Debe degradar con elegancia si faltan métricas previas.
 """
-import logging
-
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from ..pipeline.context import PipelineContext
 from ..pipeline.phase import Phase
+from ..pipeline.tool_check import DependencyReport
+
+logger = logging.getLogger(__name__)
 
 
 class DecisionPhase(Phase):
@@ -46,30 +50,22 @@ class DecisionPhase(Phase):
     """
 
     name = "decision"
-    
+    optional = False
 
-    def check_dependencies(self) -> bool:
+    def check_dependencies(self) -> DependencyReport:
         """
         Esta fase no depende de librerías externas pesadas.
         """
-        return True
+        return DependencyReport(phase_name=self.name, checks=[])
 
-    def run(self, ctx) -> None:
-        logging.info("Iniciando ejecución del pipeline")
-        for phase in self.phases:
-            phase_name = phase.__class__.__name__
-            logging.info(f"--- Ejecutando fase: {phase_name} ---")
-            try:
-                phase.execute(self.context)
-                logging.info(f"Fase {phase_name} completada exitosamente")
-            except Exception as e:
-                logging.error(f"Error en fase {phase_name}: {str(e)}", exc_info=True)
-                # Dependiendo de la estrategia, podrías detener o continuar
-                raise  # o break, o manejar según política
-        logging.info("Pipeline finalizado")
-        
-        
-            
+    def run(self, ctx: PipelineContext) -> None:
+        try:
+            self._run(ctx)
+        except Exception:
+            logger.error("Fallo en la fase de decisión", exc_info=True)
+            raise
+
+    def _run(self, ctx: PipelineContext) -> None:
         """
         Ejecuta el motor de decisión.
 
@@ -143,7 +139,7 @@ class DecisionPhase(Phase):
 
     def _collect_quality_rows(self, ctx, frames: List[str]) -> Dict[str, Dict[str, Any]]:
         """
-        Recoge métricas de calidad si existen.
+        Recoge métricas de calidad por frame si existen.
 
         Se toleran estructuras parciales o ausentes.
         """
@@ -157,8 +153,14 @@ class DecisionPhase(Phase):
                     frame_name = row.get("frame")
                     if frame_name:
                         quality_map[frame_name] = row
+            else:
+                logger.warning(
+                    "ctx.metrics['quality']['frames'] no es una lista; "
+                    "se usará puntuación neutra para todos los frames."
+                )
+        else:
+            logger.info("No hay métricas de calidad previas; se usará puntuación neutra.")
 
-        # Fallback: si no hay detalle por frame, devolvemos mapa vacío.
         return quality_map
 
     def _collect_semantic_rows(self, ctx) -> Dict[str, Dict[str, Any]]:
@@ -468,23 +470,27 @@ class DecisionPhase(Phase):
         """
         Persiste artefactos de decisión en disco y contexto.
         """
-        decision_summary_path = colmap_dir / "decision_summary.json"
-        decision_summary_path.write_text(
-            json.dumps(decision["summary"], indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        try:
+            decision_summary_path = colmap_dir / "decision_summary.json"
+            decision_summary_path.write_text(
+                json.dumps(decision["summary"], indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
 
-        colmap_config_path = colmap_dir / "colmap_config.json"
-        colmap_config_path.write_text(
-            json.dumps(decision["colmap_config"], indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+            colmap_config_path = colmap_dir / "colmap_config.json"
+            colmap_config_path.write_text(
+                json.dumps(decision["colmap_config"], indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
 
-        frames_txt_path = colmap_dir / "frames_for_colmap.txt"
-        frames_txt_path.write_text(
-            "\n".join(decision["selected_frame_paths"]),
-            encoding="utf-8",
-        )
+            frames_txt_path = colmap_dir / "frames_for_colmap.txt"
+            frames_txt_path.write_text(
+                "\n".join(decision["selected_frame_paths"]),
+                encoding="utf-8",
+            )
+        except OSError:
+            logger.error("No se pudieron escribir los artefactos de decisión en %s", colmap_dir, exc_info=True)
+            raise
 
         ctx.decision = {
             "frames": decision["frames"],

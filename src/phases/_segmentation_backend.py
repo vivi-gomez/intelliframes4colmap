@@ -1,10 +1,117 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+# COCO class ids relevantes para "personas" y "vehículos" en modelos YOLO
+# preentrenados (ultralytics).
+_YOLO_PERSON_CLASSES = {0}                      # person
+_YOLO_VEHICLE_CLASSES = {2, 3, 5, 6, 7}         # car, motorcycle, bus, train, truck
+
+# Caché a nivel de módulo: el modelo se carga una única vez por proceso.
+# _YOLO_MODEL is None y _YOLO_UNAVAILABLE_REASON is None => aún no se probó.
+_YOLO_MODEL: Optional[Any] = None
+_YOLO_UNAVAILABLE_REASON: Optional[str] = None
+
+
+def _get_yolo_model(weights: str = "yolov8n.pt") -> Optional[Any]:
+    """
+    Carga (con caché) un modelo YOLO para detectar personas/vehículos.
+
+    Si `ultralytics` no está instalado, o falla la carga del modelo por
+    cualquier motivo (sin red para descargar los pesos, checkpoint
+    corrupto, etc.), se registra el motivo una sola vez y se devuelve
+    None. El resto del pipeline debe seguir funcionando: la detección de
+    personas/vehículos pasa a comportarse como el placeholder anterior
+    (máscara vacía) en vez de romper la fase de segmentación.
+    """
+    global _YOLO_MODEL, _YOLO_UNAVAILABLE_REASON
+
+    if _YOLO_MODEL is not None:
+        return _YOLO_MODEL
+    if _YOLO_UNAVAILABLE_REASON is not None:
+        return None
+
+    try:
+        from ultralytics import YOLO
+    except Exception as exc:
+        _YOLO_UNAVAILABLE_REASON = f"ultralytics no disponible: {exc}"
+        logger.warning(
+            "%s. Se usará máscara vacía para personas/vehículos "
+            "(instala 'ultralytics' para activar la detección real).",
+            _YOLO_UNAVAILABLE_REASON,
+        )
+        return None
+
+    try:
+        _YOLO_MODEL = YOLO(weights)
+    except Exception as exc:
+        _YOLO_UNAVAILABLE_REASON = f"No se pudo cargar el modelo YOLO '{weights}': {exc}"
+        logger.warning(
+            "%s. Se usará máscara vacía para personas/vehículos.",
+            _YOLO_UNAVAILABLE_REASON,
+        )
+        return None
+
+    logger.info("Modelo YOLO '%s' cargado correctamente para detección de personas/vehículos.", weights)
+    return _YOLO_MODEL
+
+
+def _detect_people_vehicles(img_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Detecta personas y vehículos con YOLO y devuelve dos máscaras binarias
+    (person_mask, vehicle_mask) del mismo tamaño que la imagen, rellenando
+    las cajas delimitadoras detectadas.
+
+    Degradación controlada: cualquier fallo durante la inferencia (imagen
+    inválida, error de CUDA/CPU, etc.) se registra en el log y se
+    devuelven máscaras vacías en vez de propagar la excepción, para no
+    interrumpir el resto de la fase de segmentación.
+    """
+    h, w = img_bgr.shape[:2]
+    person_mask = np.zeros((h, w), dtype=np.uint8)
+    vehicle_mask = np.zeros((h, w), dtype=np.uint8)
+
+    model = _get_yolo_model()
+    if model is None:
+        return person_mask, vehicle_mask
+
+    try:
+        results = model.predict(source=img_bgr, verbose=False, conf=0.35)
+    except Exception:
+        logger.warning("Fallo en la inferencia YOLO; se usa máscara vacía para este frame.", exc_info=True)
+        return person_mask, vehicle_mask
+
+    try:
+        for result in results:
+            boxes = getattr(result, "boxes", None)
+            if boxes is None:
+                continue
+            for box in boxes:
+                cls_id = int(box.cls[0])
+                x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w, x2), min(h, y2)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                if cls_id in _YOLO_PERSON_CLASSES:
+                    person_mask[y1:y2, x1:x2] = 255
+                elif cls_id in _YOLO_VEHICLE_CLASSES:
+                    vehicle_mask[y1:y2, x1:x2] = 255
+    except Exception:
+        logger.warning(
+            "Fallo interpretando resultados de YOLO; se usa máscara vacía para este frame.",
+            exc_info=True,
+        )
+        return np.zeros((h, w), dtype=np.uint8), np.zeros((h, w), dtype=np.uint8)
+
+    return person_mask, vehicle_mask
 
 
 CLASS_BACKGROUND = 0
@@ -118,9 +225,32 @@ def run_classical_segmentation(
             )
             continue
 
-        metrics, indexed_mask = _segment_single_image(img)
-        mask_path = masks_dir / f"{Path(frame_path).stem}__mask.png"
-        cv2.imwrite(str(mask_path), indexed_mask)
+        try:
+            metrics, indexed_mask = _segment_single_image(img)
+            mask_path = masks_dir / f"{Path(frame_path).stem}__mask.png"
+            cv2.imwrite(str(mask_path), indexed_mask)
+        except Exception:
+            logger.error("Fallo segmentando %s; se omite este frame.", frame_path, exc_info=True)
+            results.append(
+                {
+                    "frame": Path(frame_path).name,
+                    "mask_path": "",
+                    "sky_pct": 0.0,
+                    "water_pct": 0.0,
+                    "vegetation_pct": 0.0,
+                    "person_pct": 0.0,
+                    "vehicle_pct": 0.0,
+                    "reflection_pct": 0.0,
+                    "low_texture_pct": 0.0,
+                    "dynamic_risk_pct": 0.0,
+                    "usable_area_pct": 0.0,
+                    "photogrammetry_risk_score": 100.0,
+                    "risk_level": "HIGH",
+                    "segmentation_mode": "classical",
+                    "error": "segmentation_failed",
+                }
+            )
+            continue
 
         row = {
             "frame": Path(frame_path).name,
@@ -168,9 +298,11 @@ def _segment_single_image(img_bgr: np.ndarray) -> tuple[Dict[str, Any], np.ndarr
     low_texture_mask = _low_texture_mask(gray)
     low_texture_mask = _cleanup_mask(low_texture_mask, 5)
 
-    # Personas/vehículos: placeholder conservador = 0 hasta integrar detector real
-    person_mask = np.zeros((h, w), dtype=np.uint8)
-    vehicle_mask = np.zeros((h, w), dtype=np.uint8)
+    # Personas/vehículos: detección real vía YOLO (ver _detect_people_vehicles).
+    # Si el modelo no está disponible, la función ya degrada a máscara vacía
+    # de forma controlada, así que este bloque nunca lanza excepciones hacia
+    # arriba y el resto de la segmentación clásica sigue funcionando igual.
+    person_mask, vehicle_mask = _detect_people_vehicles(img_bgr)
 
     # Resolver solapes por prioridad
     _paint(indexed_mask, low_texture_mask, CLASS_LOW_TEXTURE)

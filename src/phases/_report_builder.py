@@ -22,8 +22,8 @@ def build_analysis_payload(ctx) -> Dict[str, Any]:
     """
     return {
         "input": {
-            "input_path": getattr(ctx, "input_path", None),
-            "workspace_dir": getattr(ctx, "workspace_dir", None),
+            "input_path": str(getattr(ctx, "input_path", "") or ""),
+            "output_dir": str(getattr(ctx, "output_dir", "") or ""),
             "total_frames": len(list(getattr(ctx, "frame_list", []) or [])),
         },
         "quality": getattr(ctx, "metrics", {}).get("quality", {}),
